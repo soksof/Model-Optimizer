@@ -1142,15 +1142,16 @@ def parallel_load_and_prepare_fsdp2(
     return model
 
 
-def _auto_class(hf_config, trust_remote_code: bool = False) -> Any:
-    """The auto class that builds ``hf_config``'s whole model, LM head included.
+def _auto_class(hf_config, require_lm_head: bool = True, trust_remote_code: bool = False) -> Any:
+    """The auto class that builds ``hf_config``'s whole model.
 
     A causal LM builds through ``AutoModelForCausalLM``. A VLM -- a nested text config, a vision
-    config, or a ``*ForConditionalGeneration`` architecture -- builds through the remote
+    config, or a ``*ForConditionalGeneration`` architecture -- builds through ``AutoModel``, which
+    leaves its LM head out. ``require_lm_head`` builds it with the head: through the remote
     ``AutoModelForCausalLM`` when the checkpoint registers its ``*ForConditionalGeneration`` there,
     its code is trusted and it registers no image-text class, else through
     ``AutoModelForImageTextToText`` if that recognizes the config or, its code trusted, the
-    checkpoint registers one, else through ``AutoModel``, which leaves the head out.
+    checkpoint registers one.
     """
     architectures = getattr(hf_config, "architectures", None) or []
     is_vlm = (
@@ -1160,6 +1161,8 @@ def _auto_class(hf_config, trust_remote_code: bool = False) -> Any:
     )
     if not is_vlm:
         return AutoModelForCausalLM
+    if not require_lm_head:
+        return AutoModel
     auto_map = getattr(hf_config, "auto_map", None) or {}
     remote_with_head = (
         trust_remote_code
@@ -1258,7 +1261,7 @@ def _decide_distribution(
             trust_remote_code,
             None,
             hf_config,
-            auto_class=_auto_class(hf_config, trust_remote_code),
+            auto_class=_auto_class(hf_config, trust_remote_code=trust_remote_code),
         )
     except Exception as e:
         raise RuntimeError(
