@@ -1305,6 +1305,7 @@ def _decide_distribution(
         _ep_config,
         _num_experts_from_config,
         _routed_expert_modules,
+        _spec_ep_plan,
     )
 
     if world_size == 1:
@@ -1399,7 +1400,14 @@ def _decide_distribution(
         raise NotImplementedError(
             f"The dense part of {hf_config.model_type} cannot be sharded {unshardable}.{remedy}"
         )
-    if experts and ep_size == 1 and dense == "replicate":
+    # An EP degree of 1 skips the model's spec (resolve_distribution_plan), so a model whose plan only
+    # its spec supplies shows no routed experts above: look for them through the plan the spec would
+    # supply, or such an MoE would load whole on every rank where one carrying its own plan refuses.
+    if (
+        ep_size == 1
+        and dense == "replicate"
+        and (experts or _routed_expert_modules(model, _spec_ep_plan(hf_config.model_type)))
+    ):
         raise RuntimeError(
             f"{hf_config.model_type} can be expert-parallel, but the plan resolved to ep_size=1 at "
             f"world_size={world_size}, so every rank would hold the whole MoE. Shard its experts "
