@@ -384,6 +384,32 @@ def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of
     assert classes == [True]
 
 
+def test_a_compressed_checkpoint_a_spec_decompresses_as_it_loads_passes(monkeypatch):
+    """A model spec that installs the on-the-fly decompressor (Kimi-K2.5's) marks the config; that
+    checkpoint passes the format check, and the same checkpoint unmarked does not."""
+    from modelopt.torch.models import _onfly_decompress
+
+    class _ResolvedPastFormatError(Exception):
+        """Stops the load where it resolves the checkpoint, past the format check."""
+
+    def resolve(path, rank):
+        raise _ResolvedPastFormatError
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
+    monkeypatch.setattr(model_load_utils, "_resolve_checkpoint_dir", resolve)
+    config = SimpleNamespace(quantization_config={"quant_method": "compressed-tensors"})
+    plan = DistributionPlan(2, ep_size=2)
+
+    with pytest.raises(NotImplementedError, match="cannot dequantize"):
+        load_and_prepare_ep("org/model", plan, hf_config=config)
+    _onfly_decompress._mark(config, "pack-quantized")
+    with pytest.raises(_ResolvedPastFormatError):
+        load_and_prepare_ep("org/model", plan, hf_config=config)
+
+
 # ------------------------------------------------------------------------ quant wrappers
 
 
