@@ -2243,7 +2243,7 @@ def load_and_prepare_ep(
             print(
                 f"[ep] dense sharded: FSDP2-sharded {n_dense} dense module(s) on mesh "
                 f"{dense_fsdp_mesh.mesh_dim_names}={_dims} (shard over ep={ep_degree}, replicate over "
-                f"edp={dp}); experts EP-sharded on ep",
+                f"edp={plan.edp}); experts EP-sharded on ep",
                 flush=True,
             )
 
