@@ -1044,6 +1044,7 @@ def auto_quantize(
                 "Please run auto_quantize with 'max' or 'mse' calibration and use "
                 "get_auto_quantize_config() to obtain a config for mtq.quantize()."
             )
+        _refuse_rank_local_calibration(model, algo)
 
     # Select the appropriate searcher based on method
     if method_name not in AUTO_QUANTIZE_SEARCHERS:
