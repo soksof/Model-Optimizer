@@ -21,7 +21,6 @@ import os
 import re
 from itertools import chain
 from typing import TYPE_CHECKING, Any
-from warnings import warn
 
 import torch
 import torch.nn as nn
@@ -45,10 +44,9 @@ from modelopt.torch.utils.distributed import (
     barrier,
     broadcast_state_dict,
     is_initialized,
-    rank,
     set_distribution_plan,
 )
-from modelopt.torch.utils.logging import print_rank_0
+from modelopt.torch.utils.logging import print_rank_0, warn_rank_0
 from modelopt.torch.utils.plugins.hf_checkpoint_utils import (
     checkpoint_tensor_files,
     ensure_local_checkpoint,
@@ -850,6 +848,16 @@ def _meta_dcp_load(
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint import HuggingFaceStorageReader
 
+    # Read what the checkpoint holds before changing the model, so a refusal leaves it as it was.
+    reader = HuggingFaceStorageReader(str(local_dir))
+    ckpt_keys = set(reader.read_metadata().state_dict_metadata.keys())
+    if not ckpt_keys:
+        raise RuntimeError(
+            f"meta+DCP load: the checkpoint at {local_dir} has NO tensors -- the resolved snapshot carries no "
+            "safetensors (a config-only / incomplete HF revision; e.g. refs/main pointing at a weightless "
+            "snapshot). Re-download the checkpoint or pass a complete local snapshot dir / pinned revision."
+        )
+
     # Snapshot real buffers (to_empty re-empties them), materialize params, restore buffers. Materialize
     # selectively, module by module, so the real experts are not re-emptied. That is safe only because no
     # root is fully_shard-ed: a per-module loop corrupts a ROOT-sharded FSDP state (its state_dict then
@@ -877,6 +885,9 @@ def _meta_dcp_load(
         for n, src in saved_params.items():
             p = model.get_parameter(n)
             p.copy_(src.to(device=p.device, dtype=p.dtype))
+    # The clones are restored; only the names of the params they kept are needed from here on.
+    kept_names = set(saved_params)
+    del saved_buffers, saved_params
 
     # ``dcp.load`` matches state_dict entries to checkpoint entries BY NAME, but a checkpoint's stored key
     # names can differ from the built model's ``state_dict`` names, and from_pretrained bridges the gap on
@@ -886,14 +897,6 @@ def _meta_dcp_load(
     # match would SILENTLY skip every renamed weight (they stay ``to_empty`` garbage -> a wrecked model that
     # only surfaces as a confusing downstream crash). Reproduce from_pretrained's result generically via
     # :func:`_map_ckpt_keys_to_model`: exact -> conversion-mapping regexes -> longest UNIQUE suffix.
-    reader = HuggingFaceStorageReader(str(local_dir))
-    ckpt_keys = set(reader.read_metadata().state_dict_metadata.keys())
-    if not ckpt_keys:
-        raise RuntimeError(
-            f"meta+DCP load: the checkpoint at {local_dir} has NO tensors -- the resolved snapshot carries no "
-            "safetensors (a config-only / incomplete HF revision; e.g. refs/main pointing at a weightless "
-            "snapshot). Re-download the checkpoint or pass a complete local snapshot dir / pinned revision."
-        )
     full_sd = (
         model.state_dict()
     )  # (sharded ``DTensor`` or plain) params + replicated persistent buffers
@@ -932,16 +935,16 @@ def _meta_dcp_load(
             f"{sorted(unloaded)[:5]}. Replicating the dense part (MODELOPT_FSDP_SIZE=1) loads it through "
             "from_pretrained instead."
         )
-    if is_initialized() and rank() == 0:
-        loaded_bufs = mapped_names - {n for n, _ in model.named_parameters()}
-        if loaded_bufs:
-            warn(
-                f"meta+DCP load: loaded {len(loaded_bufs)} persistent buffer(s) from checkpoint: "
-                f"{sorted(loaded_bufs)[:5]}"
-            )
+    loaded_bufs = mapped_names - {n for n, _ in model.named_parameters()}
+    if loaded_bufs:
+        warn_rank_0(
+            f"meta+DCP load: loaded {len(loaded_bufs)} persistent buffer(s) from checkpoint: "
+            f"{sorted(loaded_bufs)[:5]}"
+        )
     dcp.load(load_sd, storage_reader=reader)
-    # Taken before tying, which can swap a filled param out of its module.
-    filled = {n: model.get_parameter(n) for n in want_params & mapped_names}
+    # Taken before tying, which can swap a filled param out of its module; in state_dict order, the
+    # same on every rank, so every rank keeps the same param of a tied group.
+    filled = {n: model.get_parameter(n) for n in full_sd if n in want_params and n in mapped_names}
     if hasattr(model, "tie_weights"):
         model.tie_weights()  # re-establish tied weights the checkpoint omitted
     # Tying keeps one param of each tied group, not necessarily the one the checkpoint filled: a tied
@@ -953,13 +956,12 @@ def _meta_dcp_load(
         if id(kept) not in loaded:
             _copy_tied_values(kept, src, name)
             loaded.add(id(kept))
-    # A re-emptied target param no checkpoint tensor filled, and that tying did not make a loaded param,
-    # still holds ``to_empty``'s memory. from_pretrained would initialize it; this loader can't run the
-    # model's init on shards, so it fails rather than return the model. Every rank reaches the same verdict.
+    # A re-emptied param no checkpoint tensor filled, and that tying did not make a loaded param, still
+    # holds ``to_empty``'s memory, whether or not ``load_names`` named it. from_pretrained would
+    # initialize it; this loader can't run the model's init on shards, so it fails rather than return
+    # the model. Every rank reaches the same verdict.
     unfilled = sorted(
-        n
-        for n in (unloaded & emptied) - saved_params.keys()
-        if id(model.get_parameter(n)) not in loaded
+        n for n in emptied - mapped_names - kept_names if id(model.get_parameter(n)) not in loaded
     )
     if unfilled:
         raise RuntimeError(
