@@ -745,7 +745,8 @@ def _fsdp2_wrap_modules(model: "torch.nn.Module") -> list["torch.nn.Module"]:
     FSDP-sharding the vision blocks makes the calibration weight-access all-gather on those sharded vision
     weights DEADLOCK; keeping the vision/audio towers REPLICATED (plain) -- the language-only calibration
     never runs them and they are small enough to fit -- avoids that. This also covers VLMs whose top-level
-    wrapper exposes no ``_no_split_modules`` at all (e.g. Nemotron-Nano-VL).
+    wrapper exposes no ``_no_split_modules`` at all (e.g. Nemotron-Nano-VL). A VLM whose language
+    backbone shows no blocks is refused rather than wrapped by the wrapper's list.
     """
     from modelopt.torch.quantization.utils.layerwise_calib import LayerActivationCollector
 
@@ -762,17 +763,14 @@ def _fsdp2_wrap_modules(model: "torch.nn.Module") -> list["torch.nn.Module"]:
     from modelopt.torch.export.model_utils import get_language_model_from_vl
 
     lineage = get_language_model_from_vl(model)
-    if lineage and lineage[-1] is not model:
-        lm_mods = _boundaries(lineage[-1])
-        if lm_mods:
-            return lm_mods
-
-    mods = _boundaries(model)
+    root = lineage[-1] if lineage else model
+    mods = _boundaries(root)
     if mods:
         return mods
     raise RuntimeError(
-        "Could not determine FSDP2 wrap boundaries: model exposes no `_no_split_modules` and modelopt's "
-        "decoder-layer auto-detection did not match. Provide a standard HF causal-LM / VLM checkpoint."
+        f"Could not determine FSDP2 wrap boundaries: {type(root).__name__} exposes no "
+        "`_no_split_modules` and modelopt's decoder-layer auto-detection did not match. Provide a "
+        "standard HF causal-LM / VLM checkpoint, or replicate the dense part (MODELOPT_FSDP_SIZE=1)."
     )
 
 
@@ -1334,8 +1332,7 @@ def _decide_distribution(
             f"({num_experts})."
         )
     # Why the expert-parallel load cannot shard the dense part, if it cannot: the export cannot write
-    # it sharded within several expert-data-parallel replicas, and Distributed Checkpoint, which
-    # loads it sharded, cannot dequantize a block-fp8 checkpoint's F8_E8M0 scales.
+    # it sharded within several expert-data-parallel replicas.
     unshardable, remedy = None, ""
     if ep_size > 1 and world_size // ep_size > 1:
         unshardable = (
@@ -1346,8 +1343,6 @@ def _decide_distribution(
             " Set MODELOPT_EP_DEGREE to the world size if it divides the expert count, or "
             "MODELOPT_FSDP_SIZE=1 if the dense part fits one GPU."
         )
-    elif ep_size > 1 and _ckpt_quant_method(hf_config) == "fp8":
-        unshardable = "from a block-fp8 checkpoint: Distributed Checkpoint cannot dequantize its F8_E8M0 scales"
     if dense == "auto":
         # A rank holds a whole copy of what expert parallelism does not shard, and its 1/ep_size
         # share of the routed experts it does.
@@ -1940,8 +1935,7 @@ def load_and_prepare_ep(
 
     With ``plan.dense == "fsdp"`` the dense part is instead FSDP2-sharded over the ``ep`` group and each
     rank loads only its shard from the checkpoint, never the whole of it -- for a model whose dense part
-    does not fit one GPU. A block-fp8 checkpoint cannot be loaded that way: Distributed Checkpoint
-    cannot dequantize its F8_E8M0 scales.
+    does not fit one GPU.
 
     EP CANNOT be applied to a meta-init model (transformers' ``GroupedGemmParallel.shard_tensor``
     slices materialized tensors), so this loads real weights via ``from_pretrained`` over the ``ep``
@@ -2004,11 +1998,6 @@ def load_and_prepare_ep(
             config_kwargs["attn_implementation"] = attn_implementation
         hf_config = AutoConfig.from_pretrained(ckpt_path, **config_kwargs)
     quant_method = _ckpt_quant_method(hf_config)
-    if plan.is_fsdp_dense and quant_method == "fp8":
-        raise NotImplementedError(
-            f"{plan!r}: the dense part of a block-fp8 checkpoint cannot be sharded, since Distributed "
-            "Checkpoint cannot dequantize its F8_E8M0 scales. Plan dense='replicate'."
-        )
     if quant_method not in _EP_SOURCE_FORMATS:
         # transformers' own quantizer would load it as stored, for PTQ to treat as plain weights.
         dequantized = ", ".join(sorted(f for f in _EP_SOURCE_FORMATS if f))
@@ -2246,10 +2235,8 @@ def load_and_prepare_ep(
         # Fully-distributed dense: dense was left on meta during from_pretrained; FSDP2-shard it over the
         # full-world mesh and DCP-load each rank's shard directly (never replicated anywhere).
         dense_fsdp_mesh = dense_mesh["dp"]
-        # Collective: rank 0 makes the checkpoint local (downloading a Hub ID once); the others wait.
-        _, local_dir = ensure_local_checkpoint(ckpt_path)
         n_dense = _load_ep_dense_distributed(
-            model, dense_fsdp_mesh, local_dir, is_expert_fn, expert_modules.values()
+            model, dense_fsdp_mesh, ckpt_path, is_expert_fn, expert_modules.values()
         )
         if is_master():
             _dims = tuple(dense_fsdp_mesh.shape)

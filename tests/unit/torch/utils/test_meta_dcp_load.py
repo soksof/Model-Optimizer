@@ -203,10 +203,27 @@ def test_wrap_modules_fall_back_to_decoder_layer_detection(no_split_modules):
     assert _fsdp2_wrap_modules(model) == list(model.model.layers)
 
 
-def test_wrap_modules_refuse_a_model_without_blocks():
-    """With neither source of boundaries matching, fail loudly instead of guessing a layout."""
+def _vlm_whose_language_model_shows_no_blocks():
+    """A VLM whose own ``_no_split_modules`` names its vision block too, as Qwen2.5-VL's does."""
+    model = nn.Module()
+    model._no_split_modules = ["Linear"]
+    model.language_model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    model.visual = nn.Linear(2, 2)
+    return model
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)), id="no-blocks"),
+        pytest.param(_vlm_whose_language_model_shows_no_blocks, id="vlm-language-model"),
+    ],
+)
+def test_wrap_modules_refuse_a_model_without_blocks(build):
+    """With neither source of boundaries matching, fail loudly instead of guessing a layout. For a
+    VLM that is its language model's: the VLM's own list would shard the vision blocks too."""
     with pytest.raises(RuntimeError, match="Could not determine FSDP2 wrap boundaries"):
-        _fsdp2_wrap_modules(nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)))
+        _fsdp2_wrap_modules(build())
 
 
 # --------------------------------------------------------------------------------- meta + DCP load

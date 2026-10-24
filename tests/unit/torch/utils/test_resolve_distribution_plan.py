@@ -450,27 +450,18 @@ def test_what_a_rank_holds_with_the_dense_part_replicated_must_fit(
 
 
 @needs_qwen3_moe_ep_plan
-@pytest.mark.parametrize(
-    ("num_experts", "quant_method", "ep_size", "match"),
-    [(8, "fp8", 4, "block-fp8"), (2, None, 2, "2 expert-data-parallel replicas")],
-    ids=["block-fp8", "several-ep-groups"],
-)
 def test_a_dense_part_the_expert_parallel_load_cannot_shard_is_replicated(
-    run_as, serve, gpu_memory, tmp_path, num_experts, quant_method, ep_size, match
+    run_as, serve, gpu_memory, tmp_path
 ):
-    """The expert-parallel load cannot shard the dense part of a block-fp8 checkpoint, which DCP
-    cannot dequantize, nor within several EP groups, which the export cannot write. Left to decide,
-    the plan replicates it however big; asked to shard it, it refuses. Without expert parallelism
-    neither rule applies."""
+    """The expert-parallel load cannot shard the dense part within several EP groups, which the
+    export cannot write: 2 experts over 4 ranks. Left to decide, the plan replicates it however
+    big; asked to shard it, it refuses. Without expert parallelism the rule does not apply."""
     run_as(4)
-    config = _qwen3_moe(num_experts=num_experts)
-    if quant_method:
-        config.quantization_config = {"quant_method": quant_method}
-    serve(config)
+    serve(_qwen3_moe(num_experts=2))
     gpu_memory(1)
 
-    assert resolve_distribution_plan(str(tmp_path))[0] == DistributionPlan(4, ep_size)
-    with pytest.raises(NotImplementedError, match=match):
+    assert resolve_distribution_plan(str(tmp_path))[0] == DistributionPlan(4, 2)
+    with pytest.raises(NotImplementedError, match="2 expert-data-parallel replicas"):
         resolve_distribution_plan(str(tmp_path), dense="fsdp")
     assert resolve_distribution_plan(str(tmp_path), ep_size=1)[0] == DistributionPlan(
         4, dense="fsdp"
