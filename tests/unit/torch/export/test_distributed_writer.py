@@ -246,6 +246,10 @@ def _refusing_materialize_job(rank, world_size, case):
                 (torch.zeros(2, 4), Shard(0)) if rank == 0 else (torch.zeros(4, 2), Shard(1))
             )
             gshape = (4, 4)
+        elif case == "dtype":
+            # Rank 1 cast its shard: the transfer's byte counts would not match.
+            dtype = torch.float32 if rank == 0 else torch.bfloat16
+            local, placement, gshape = torch.zeros(2, 4, dtype=dtype), Shard(0), (4, 4)
         else:
             # A rewrap that re-inferred the global shape per rank: rank 0's own view tiles, rank 1's not.
             local, placement, gshape = torch.zeros(2, 4), Shard(0), (4 if rank == 0 else 3, 4)
@@ -259,15 +263,45 @@ def _refusing_materialize_job(rank, world_size, case):
         raised = str(error)
     else:
         raised = "no error"
-    match = "do not tile their global shape" if case == "global-shape" else "cannot materialize"
+    match = {"global-shape": "do not tile their global shape", "dtype": "different dtype"}.get(
+        case, "cannot materialize"
+    )
     assert match in raised, raised
 
 
-@pytest.mark.parametrize("case", ["smaller-mesh", "placement", "global-shape"])
+@pytest.mark.parametrize("case", ["smaller-mesh", "placement", "global-shape", "dtype"])
 def test_materialize_owned_refuses_on_every_rank(cpu_dist_workers, case):
     """Every rank refuses, the ranks whose own view looks fine included, instead of waiting in a
     collective the refusing rank never joins."""
     cpu_dist_workers.run(_refusing_materialize_job, case=case)
+
+
+def _materialize_two_ranks_job(rank, world_size):
+    mesh = init_device_mesh("cpu", (world_size,))
+    torch.manual_seed(0)
+    full = {
+        "a.weight": torch.randn(7, 4),  # uneven: 4 + 3 rows
+        "b.weight": torch.randn(8, 3).to(torch.bfloat16),  # a second dtype between the same ranks
+        "c.weight": torch.randn(2, 5),
+        "d.weight": torch.randn(1, 6),  # rank 1's shard is empty
+    }
+    sd = {k: distribute_tensor(v, mesh, [Shard(0)]) for k, v in full.items()}
+
+    with bounded_collectives():
+        _materialize_owned(sd, set(), rank, world_size)
+
+    for k, v in sd.items():
+        assert not isinstance(v, DTensor), k
+        assert torch.equal(v, full[k]), k
+    owned: list = [None] * world_size
+    torch.distributed.all_gather_object(owned, sorted(sd))
+    assert sorted(k for keys in owned for k in keys) == sorted(full)
+
+
+def test_materialize_owned_moves_each_shard_to_its_owner_over_two_ranks(cpu_dist_workers):
+    """Each key ends whole on exactly one rank, its shards packed per peer and dtype, unpacked at
+    their offsets and joined in rank order, an uneven and an empty shard included."""
+    cpu_dist_workers.run(_materialize_two_ranks_job)
 
 
 def test_revert_whole_sd_keeps_a_state_dict_with_nothing_to_revert():

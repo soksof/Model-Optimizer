@@ -130,10 +130,9 @@ def _gather_shard0_to_owners(
             n *= s
         return n
 
-    device = local_sd[keys[0]].to_local().device
-
-    # Chunk the key list so the in-flight receive buffers stay bounded. Within a chunk the op count
-    # is O(world x dtypes) regardless of how many keys it holds, so chunks can be large.
+    # A chunk bounds how many keys one round of transfers carries, not their bytes: within a chunk
+    # the op count is O(world x dtypes) however many keys it holds, and a model of fewer keys than a
+    # chunk moves in one round.
     chunk = 4096
     for base in range(0, len(keys), chunk):
         part = keys[base : base + chunk]
@@ -165,13 +164,14 @@ def _gather_shard0_to_owners(
         for srcr, dt in sorted(recv_groups, key=lambda kd: (kd[0], str(kd[1]))):
             ks = sorted(recv_groups[(srcr, dt)])
             total = sum(_numel(all_shapes[srcr][k]) for k in ks)
-            buf = torch.empty(total, dtype=dt, device=device)
+            buf = torch.empty(total, dtype=dt, device=local_sd[ks[0]].to_local().device)
             pending.append((srcr, ks, buf))
             ops.append(dist.P2POp(dist.irecv, buf, srcr))
 
         if ops:
             for req in dist.batch_isend_irecv(ops):
                 req.wait()
+        keepalive.clear()  # the sends are done: free their buffers before assembling
 
         # Unpack each peer's flat buffer back into per-key views, in the same order it was packed.
         parts_by_key: dict = {}
@@ -197,7 +197,7 @@ def _gather_shard0_to_owners(
                 elif r in got:
                     pieces.append(got[r])
             local_sd[k] = torch.cat(pieces, dim=0)
-        del keepalive, pending, parts_by_key
+        del pending, parts_by_key
 
 
 def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: int) -> None:
@@ -210,7 +210,8 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
 
     This is the step that lets the reverse conversion run: afterwards nothing is a DTensor and no
     tensor is partial, so transformers' conversion ops see the whole tensors they were written for.
-    It is NOT a gather to a single rank -- peak memory is this rank's owned set, not the model.
+    It is NOT a gather to a single rank: at its peak a rank holds its own shards plus its owned set
+    about twice over (the shards it received and the tensors assembled from them), not the model.
     """
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor
@@ -254,6 +255,7 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
         {k: tuple(local_sd[k].to_local().shape) for k in shard0},
         {k: tuple(local_sd[k].shape) for k in shard0},
         [(k, pl, f"mesh.ndim={nd}") for k, pl, nd in unsupported[:3]],
+        {k: str(local_sd[k].dtype) for k in shard0},
     )
     meta: list = [None] * world
     dist.all_gather_object(meta, my_meta)
@@ -279,6 +281,7 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
     expert_bytes = [m[1] for m in meta]
     all_shapes = [m[2] for m in meta]
     global_shapes = [m[3] for m in meta]
+    dtypes = [m[5] for m in meta]
 
     # all_shapes[r] is keyed by rank r's shard0 bucket, so its key SET is that rank's classification.
     # Those buckets come from per-rank DTensor metadata, and a rank that disagrees makes the loop
@@ -304,8 +307,12 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
     # misaligned) tensor rather than failing -- so verify instead of assuming. The global shape is
     # the gathered one too: ranks that inferred different global shapes (the rewrap above) make the
     # tensor untiled on every rank, not only on the rank whose own view does not add up.
-    untiled = []
+    untiled, mixed = [], []
     for k in shard0:
+        # A shard is sent in the sender's dtype and received in the owner's: ranks that disagree
+        # would mismatch the transfer's byte counts and hang in it.
+        if len({dtypes[r][k] for r in range(world)}) > 1:
+            mixed.append((k, [dtypes[r][k] for r in range(world)][:3]))
         gshapes = {global_shapes[r][k] for r in range(world)}
         gshape = next(iter(gshapes))
         shard_shapes = [all_shapes[r][k] for r in range(world)]
@@ -314,6 +321,11 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
             and all(tuple(s[1:]) == gshape[1:] for s in shard_shapes)
         ):
             untiled.append((k, sorted(gshapes), shard_shapes[:3]))
+    if mixed:
+        raise RuntimeError(
+            f"rank {rank}: {len(mixed)} dim-0 sharded tensor(s) have a different dtype on different "
+            f"ranks, so their shards cannot be moved to one rank; first few: {mixed[:2]}"
+        )
     if untiled:
         raise RuntimeError(
             f"rank {rank}: {len(untiled)} dim-0 sharded tensor(s) do not tile their global shape, "
@@ -336,7 +348,7 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
     for k in empty0:
         if owner[k] == rank:
             _v = local_sd[k]
-            local_sd[k] = torch.empty(tuple(_v.shape), dtype=_v.dtype, device="cpu")
+            local_sd[k] = torch.empty(tuple(_v.shape), dtype=_v.dtype, device=_v.to_local().device)
         else:
             del local_sd[k]
     for k in replicated:
