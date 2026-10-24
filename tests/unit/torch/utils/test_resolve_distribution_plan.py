@@ -440,34 +440,44 @@ def test_only_an_expert_parallel_plan_carries_the_spec_plan_on(run_as, serve, tm
 
 
 def test_a_run_without_expert_parallelism_needs_no_spec(run_as, serve, monkeypatch, tmp_path):
-    """GPT-OSS cannot be expert-parallel, which its spec says by refusing. A run that rules expert
-    parallelism out, as FSDP2 does, does not ask its spec, and its spec does not refuse it."""
+    """GPT-OSS cannot be expert-parallel, which its spec says by refusing an EP degree above 1. A run
+    that rules expert parallelism out does not ask its spec, nor does one leaving the EP degree to
+    auto, which picks none for it: asking for FSDP2 alone shards it whole."""
     run_as(2)
     serve(GptOssConfig(num_local_experts=4, **_TINY))
 
     with pytest.raises(NotImplementedError, match="cannot be quantized expert-parallel yet"):
-        resolve_distribution_plan(str(tmp_path))
+        resolve_distribution_plan(str(tmp_path), ep_size=2)
     plan, _ = resolve_distribution_plan(str(tmp_path), ep_size=1, dense="fsdp")
     assert plan == DistributionPlan(2, dense="fsdp")
+    monkeypatch.setenv("MODELOPT_FSDP_SIZE", "world")
+    assert resolve_distribution_plan(str(tmp_path))[0] == plan
     monkeypatch.setenv("MODELOPT_EP_DEGREE", "1")
-    assert resolve_distribution_plan(str(tmp_path), dense="fsdp")[0] == plan
+    assert resolve_distribution_plan(str(tmp_path))[0] == plan
 
 
 # The refusals of an MoE left whole on every rank, by whether its spec allows expert parallelism.
-_CAN_BE_EP = "can be expert-parallel, but the plan resolved"
+_CAN_BE_EP = "can be expert-parallel, but the plan resolved .* dividing both its {} experts"
 _NO_EP_YET = "cannot be quantized expert-parallel yet, and the plan replicates"
 
 
 @pytest.mark.parametrize(
     ("config", "ep_degree", "refusal"),
     [
-        pytest.param(_deepseek_v3(n_routed_experts=3), None, _CAN_BE_EP, id="auto_finds_no_degree"),
-        pytest.param(_qwen3_moe(num_experts=8), "1", _CAN_BE_EP, id="explicit_degree_one"),
         pytest.param(
-            _deepseek_v3(n_routed_experts=8), "1", _CAN_BE_EP, id="explicit_degree_one_spec_plan"
+            _deepseek_v3(n_routed_experts=3), None, _CAN_BE_EP.format(3), id="auto_finds_no_degree"
         ),
         pytest.param(
-            GptOssConfig(num_local_experts=4, **_TINY), "1", _NO_EP_YET, id="spec_refuses_ep"
+            _qwen3_moe(num_experts=8), "1", _CAN_BE_EP.format(8), id="explicit_degree_one"
+        ),
+        pytest.param(
+            _deepseek_v3(n_routed_experts=8),
+            "1",
+            _CAN_BE_EP.format(8),
+            id="explicit_degree_one_spec_plan",
+        ),
+        pytest.param(
+            GptOssConfig(num_local_experts=4, **_TINY), None, _NO_EP_YET, id="spec_refuses_ep"
         ),
     ],
 )
@@ -477,9 +487,10 @@ def test_an_ep_capable_moe_left_whole_on_every_rank_is_an_error(
     """No EP degree above 1 divides 3 experts over 2 ranks, and an explicit 1 asks for none,
     whether the plan comes with the config (Qwen3-MoE) or only from the model's spec, which an EP
     degree of 1 skips (DeepSeek-V3). With nothing sharded either, every rank would hold the whole
-    MoE: that must fail, not run. GPT-OSS carries a plan too, but its spec refuses expert
-    parallelism, so this check refuses it as an MoE that cannot be expert-parallel yet; the spec's
-    own refusal, a NotImplementedError and so a RuntimeError too, words it differently."""
+    MoE: that must fail, not run, and name the expert count an EP degree has to divide. GPT-OSS
+    carries a plan too, but its spec refuses expert parallelism, so auto picks no EP degree for it
+    and this check refuses it as an MoE that cannot be expert-parallel yet; the spec's own refusal,
+    a NotImplementedError and so a RuntimeError too, words it differently."""
     if ep_degree is not None:
         if config.model_type == "qwen3_moe" and Version(transformers.__version__) < Version("5.7"):
             pytest.skip("qwen3_moe's base_model_ep_plan ships in transformers 5.7")

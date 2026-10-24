@@ -1299,11 +1299,18 @@ def _dense_from_env(world_size: int) -> str:
     )
 
 
-def _ep_degree(ep_size) -> int | str:
-    """``ep_size`` as an EP degree or ``"auto"``; ``None`` reads ``MODELOPT_EP_DEGREE``."""
+def _ep_degree(ep_size, model_type: str) -> int | str:
+    """``ep_size`` as an EP degree or ``"auto"``; ``None`` reads ``MODELOPT_EP_DEGREE``.
+
+    Auto is 1 for a model whose spec refuses expert parallelism: only an EP degree asked for
+    explicitly meets that refusal.
+    """
+    from modelopt.torch.utils.moe import _ep_spec
+
     value = env.ep_degree() if ep_size is None else ep_size
     if str(value) in ("auto", "0"):
-        return "auto"
+        ep = _ep_spec(model_type)
+        return 1 if ep is not None and ep.unsupported else "auto"
     try:
         return int(value)
     except ValueError:
@@ -1328,12 +1335,12 @@ def _decide_distribution(
         # Nothing to shard over, so nothing about the model matters, nor do the knobs: a shell still
         # exporting a multi-GPU run's would otherwise reshape a single process's load. The caller's
         # own arguments still count, as dense="fsdp" for FSDP2 on one rank.
-        single = 1 if ep_size is None else _ep_degree(ep_size)
+        single = 1 if ep_size is None else _ep_degree(ep_size, hf_config.model_type)
         return DistributionPlan(
             ep_size=single if isinstance(single, int) else 1,
             dense="replicate" if dense in (None, "auto") else dense,
         )
-    ep_size = _ep_degree(ep_size)
+    ep_size = _ep_degree(ep_size, hf_config.model_type)
     dense = _dense_from_env(world_size) if dense is None else dense
     if (
         auto_class not in (None, AutoModelForCausalLM)
@@ -1362,6 +1369,11 @@ def _decide_distribution(
         ) from e
     ep_plan = getattr(_ep_config(hf_config), "base_model_ep_plan", None) or {}
     experts = _routed_expert_modules(model, ep_plan)
+    if not experts and ep_size == 1:
+        # An EP degree of 1 skips the model's spec (resolve_distribution_plan), so a model whose plan
+        # only its spec supplies shows no routed experts: look for them through the plan the spec
+        # would supply, or such an MoE would load whole on every rank where one with its own refuses.
+        experts = _routed_expert_modules(model, _spec_ep_plan(hf_config.model_type))
     num_experts = _num_experts_from_config(hf_config) if experts else 0
     if ep_size == "auto":
         ep_size = _choose_ep_degree(world_size, num_experts)
@@ -1416,14 +1428,7 @@ def _decide_distribution(
         raise NotImplementedError(
             f"The dense part of {hf_config.model_type} cannot be sharded {unshardable}.{remedy}"
         )
-    # An EP degree of 1 skips the model's spec (resolve_distribution_plan), so a model whose plan only
-    # its spec supplies shows no routed experts above: look for them through the plan the spec would
-    # supply, or such an MoE would load whole on every rank where one carrying its own plan refuses.
-    if (
-        ep_size == 1
-        and dense == "replicate"
-        and (experts or _routed_expert_modules(model, _spec_ep_plan(hf_config.model_type)))
-    ):
+    if ep_size == 1 and dense == "replicate" and experts:
         fsdp2 = "(--use_fsdp2 in examples/hf_ptq/hf_ptq.py, or MODELOPT_FSDP_SIZE=world)"
         ep = _ep_spec(hf_config.model_type)
         if ep is not None and ep.unsupported:
@@ -1475,7 +1480,8 @@ def resolve_distribution_plan(
     hang. Collective: every rank must call it.
 
     * ``ep_size``: the expert-parallel degree, or ``"auto"``, the largest that divides both the
-      world and the routed-expert count of a model whose config carries a ``base_model_ep_plan``.
+      world and the routed-expert count of a model whose config carries a ``base_model_ep_plan``,
+      and 1 for a model whose spec refuses expert parallelism.
     * ``dense``: ``"replicate"`` or ``"fsdp"`` for the rest of the model, or ``"auto"``, which
       FSDP2-shards it when a whole copy of it and the rank's share of the routed experts would take
       more than 60% of one GPU's memory. That GPU is rank 0's, by its total memory, so ``"auto"``
@@ -1499,8 +1505,9 @@ def resolve_distribution_plan(
     ``config``, the config the load will use when the caller has one, is decided from instead of
     the checkpoint's, which is then not read: each rank takes a copy, as building writes to it.
 
-    Unless rank 0's knobs rule expert parallelism out (a single process, or an EP degree of 1),
-    every rank applies the model's spec to a copy of the config first
+    Unless rank 0's knobs rule expert parallelism out (a single process, or an EP degree of 1,
+    which auto is for a model whose spec refuses expert parallelism), every rank applies the
+    model's spec to a copy of the config first
     (:func:`~modelopt.torch.utils.moe.apply_distributed_support`): for several models it is what
     supplies the expert-parallel plan, and an expert-parallel plan returns that copy. Any other
     plan returns the config without it, which the export would otherwise write out. A plan that
@@ -1544,8 +1551,7 @@ def resolve_distribution_plan(
     # they shard by, and fail once the mesh is up, leaving them waiting in a collective.
     prepared = [hf_config]
     if dist.broadcast_from(
-        "spec",
-        lambda: world_size > 1 and str(env.ep_degree() if ep_size is None else ep_size) != "1",
+        "spec", lambda: world_size > 1 and _ep_degree(ep_size, hf_config.model_type) != 1
     ):
         # Before deciding: deciding without the spec would read an expert-parallel MoE as dense. A
         # rank that cannot apply it fails every rank, as a checkpoint read does above.
