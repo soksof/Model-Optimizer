@@ -969,6 +969,31 @@ def test_main_makes_a_hub_checkpoint_local_before_loading(monkeypatch, tmp_path)
     ]
 
 
+@pytest.mark.parametrize("is_main", [True, False], ids=["rank_0", "other_rank"])
+def test_one_rank_runs_the_gpu_memory_monitor(monkeypatch, tmp_path, is_main):
+    """The monitor reads every GPU on the node: one per rank would poll them all once per rank and
+    print the same report once per rank."""
+    hf_ptq, args = _parse_hf_ptq_args(monkeypatch, "--pyt_ckpt_path", str(tmp_path))
+    args.dist_state = SimpleNamespace(is_main=is_main, world_size=2)
+    launched = []
+
+    class _LoadReachedError(Exception):
+        pass
+
+    def load_model(args):
+        raise _LoadReachedError
+
+    monkeypatch.setattr(torch.compiler, "set_stance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hf_ptq, "launch_memory_monitor", lambda: launched.append(True))
+    monkeypatch.setattr(hf_ptq, "ensure_local_checkpoint", lambda path: (None, path))
+    monkeypatch.setattr(hf_ptq, "load_model", load_model)
+
+    with pytest.raises(_LoadReachedError):
+        hf_ptq._main_inner(args)
+
+    assert len(launched) == is_main
+
+
 def test_tensorrt_llm_export_copies_non_model_files_from_the_local_copy(monkeypatch, tmp_path):
     """The deprecated TensorRT-LLM exporter does not copy them itself; hf_ptq does, from disk."""
     hf_ptq, args = _parse_hf_ptq_args(

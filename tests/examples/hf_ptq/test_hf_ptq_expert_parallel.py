@@ -704,31 +704,47 @@ def test_the_offline_specdec_loader_is_split_across_ranks_too(hf_ptq):
 
 
 @pytest.mark.parametrize(
-    ("plan", "raises"),
-    [(DistributionPlan(4), False), (DistributionPlan(4, ep_size=4), True)],
-    ids=["replicated", "expert_parallel"],
+    ("plan", "nemotron_vl", "raises"),
+    [
+        (DistributionPlan(4), False, False),
+        (DistributionPlan(4, ep_size=4), False, True),
+        (DistributionPlan(4, ep_size=4), True, True),
+    ],
+    ids=["replicated", "expert_parallel", "expert_parallel_nemotron_vl"],
 )
-def test_a_failed_preview_of_a_sharded_model_stops_the_run(hf_ptq, monkeypatch, plan, raises):
+def test_a_failed_preview_of_a_sharded_model_stops_the_run(
+    hf_ptq, monkeypatch, plan, nemotron_vl, raises
+):
     """A rank that skipped a sharded model's preview would leave the others decoding in lockstep,
-    blocked in the next step's collective, so the failure is raised, which aborts the run. A model
-    every rank holds whole keeps the best-effort skip."""
+    blocked in the next step's collective, so the failure is raised, which aborts the run, with the
+    preview's error as its cause. A model every rank holds whole keeps the best-effort skip."""
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("the preview failed on this rank")
 
     class _FailingModel(torch.nn.Module):
-        def generate(self, *args, **kwargs):
-            raise RuntimeError("the preview failed on this rank")
+        generate = fail
 
     model = _FailingModel()
     set_distribution_plan(model, plan)
     monkeypatch.setattr(hf_ptq, "export_quantized", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hf_ptq, "run_nemotron_vl_preview", fail)  # as vlm_utils raises in lockstep
     ids = torch.zeros(1, 4, dtype=torch.long)
-    args = SimpleNamespace(specdec_offline_dataset=None, verbose=False)
+    args = SimpleNamespace(
+        specdec_offline_dataset=None,
+        verbose=False,
+        local_checkpoint_path=_CKPT,
+        trust_remote_code=False,
+    )
+    tokenizer = SimpleNamespace()
     run = lambda: hf_ptq.post_quantize(  # noqa: E731
-        args, model, model, "llama", None, None, ids, None, ids, False, None, None
+        args, model, model, "llama", tokenizer, None, ids, None, ids, nemotron_vl, None, None
     )
 
     if raises:
-        with pytest.raises(RuntimeError, match="failed on this rank"):
+        with pytest.raises(RuntimeError) as stopped:
             run()
+        assert "failed on this rank" in str(stopped.value.__cause__)
     else:
         with pytest.warns(UserWarning, match="sanity check failed"):
             run()
@@ -782,6 +798,38 @@ def test_the_vl_image_preview_generates_with_the_kwargs_it_is_handed(
 
     assert len(received) == 1
     assert received[0].get("synced_gpus", False) == (generation_kwargs is not None)
+
+
+@pytest.mark.parametrize("has_image", [True, False], ids=["a_peer_has_none", "no_rank_has_one"])
+def test_the_ranks_of_a_sharded_model_skip_the_image_preview_together(
+    monkeypatch, tmp_path, has_image
+):
+    """Each node reads the sample images from its own checkout, which may have none: the repository
+    ships none. A rank that previewed alone would wait for its peers in lockstep, so a rank with an
+    image skips when a peer has none, and when no rank has one, they all skip without stopping."""
+    monkeypatch.syspath_prepend(str(_EXAMPLES_DIR))
+    vlm_utils = importlib.import_module("vlm_utils")
+    if has_image:
+        (tmp_path / "images").mkdir()
+        Image.new("RGB", (4, 4)).save(tmp_path / "images" / "example1a.jpeg")
+    monkeypatch.setattr(vlm_utils, "__file__", str(tmp_path / "vlm_utils.py"))
+    monkeypatch.setattr(
+        vlm_utils.AutoImageProcessor, "from_pretrained", lambda *args, **kwargs: lambda images: {}
+    )
+    # This rank's answer, and a peer's that found no image.
+    monkeypatch.setattr(vlm_utils, "all_reduce", lambda label, fn, combine: combine([fn(), False]))
+
+    class _ChatModel:
+        device = torch.device("cpu")
+
+        def chat(self, *args, **kwargs):
+            pytest.fail("this rank previewed without its peers")
+
+    preview = vlm_utils.run_vl_preview_generation(
+        _ChatModel(), SimpleNamespace(eos_token_id=0), _CKPT, "stage", False, {"synced_gpus": True}
+    )
+
+    assert preview is None
 
 
 # ------------------------------------------------------------------------------------- export

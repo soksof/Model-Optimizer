@@ -121,6 +121,10 @@ from modelopt.torch.utils.vlm_dataset_utils import get_vlm_dataset_dataloader
 RAND_SEED = 1234
 # Tokens per calibration batch when layerwise calibration picks the batch size (16 x 512).
 LAYERWISE_CALIB_TOKENS = 8192
+_PREVIEW_STOPS_THE_RUN = (
+    "The preview after quantization failed, which stops the run before the export, so no "
+    "checkpoint is written; --skip_generate exports without the preview."
+)
 
 
 def _layerwise_calib_batch_size(calib_seq: int, num_samples: int) -> int:
@@ -357,14 +361,6 @@ def _resolve_distribution(args: argparse.Namespace):
             f"{plan!r} FSDP2-shards the model, which this script does under --use_fsdp2. Pass it, "
             "or set MODELOPT_FSDP_SIZE=1 if the model does fit one GPU; an MoE can instead shard its "
             "experts (MODELOPT_EP_DEGREE above 1)."
-        )
-    if plan.is_expert_parallel and plan.is_fsdp_dense and plan.edp > 1:
-        # Refused before the load: the export, after the whole calibration, is what cannot do it.
-        raise NotImplementedError(
-            f"{plan!r} FSDP2-shards the dense part within each of {plan.edp} expert-data-parallel "
-            "replicas, a layout the export cannot write yet. Set MODELOPT_EP_DEGREE to the world "
-            "size if it divides the expert count, or MODELOPT_FSDP_SIZE=1 if the dense part fits "
-            "one GPU."
         )
     if plan.world_size > 1 and _exports_tensorrt_llm_checkpoint(args, hf_model_type(hf_config)):
         # That exporter reads the process count as Megatron's training tensor parallelism. Rank 0
@@ -977,18 +973,21 @@ def post_quantize(
             if lockstep:
                 # A sharded model's ranks decode in lockstep: a rank that skipped the preview would
                 # leave the others blocked in the next step's collective. Raising aborts the run.
-                raise
+                raise RuntimeError(_PREVIEW_STOPS_THE_RUN) from e
             warnings.warn(f"Post-quantization generation sanity check failed, skipping it: {e}")
     elif is_nemotron_vl_model and tokenizer is not None:
-        generated_ids_after_ptq = run_nemotron_vl_preview(
-            full_model,
-            tokenizer,
-            preview_input_ids,
-            args.local_checkpoint_path,
-            "after quantization",
-            allow_fallback=False,
-            trust_remote_code=args.trust_remote_code,
-        )
+        try:
+            generated_ids_after_ptq = run_nemotron_vl_preview(
+                full_model,
+                tokenizer,
+                preview_input_ids,
+                args.local_checkpoint_path,
+                "after quantization",
+                allow_fallback=False,
+                trust_remote_code=args.trust_remote_code,
+            )
+        except Exception as e:
+            raise RuntimeError(_PREVIEW_STOPS_THE_RUN) from e
     else:
         warnings.warn(
             "Llama4 Maverick generation after quantization has a bug. Skipping generation sample."
@@ -1633,8 +1632,10 @@ def _main_inner(args: argparse.Namespace):
         # path.
         args.hub_model_id, args.local_checkpoint_path = ensure_local_checkpoint(args.pyt_ckpt_path)
 
-        # launch a memory monitor to read the currently used GPU memory.
-        launch_memory_monitor()
+        # launch a memory monitor to read the currently used GPU memory. It reads every GPU on the
+        # node, so a distributed run starts one, on rank 0, rather than one per rank.
+        if args.dist_state.is_main:
+            launch_memory_monitor()
 
         # Force eager execution for all model types.
         torch.compiler.set_stance("force_eager")
