@@ -1689,10 +1689,11 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
     loader's expert ``tensor_idx`` check became ``any(op is MergeModulelist ...)`` (bug 1) and
     ``_dequantize_one`` gained an ``output_dtype`` the loader passes as the destination dtype (bug 3) --
     and it added native FP4-unpack + ue8m0 (E8M0) scale decoding that our simpler override does NOT do
-    (installing it on >= 5.10.1 would BREAK ue8m0 checkpoints like DeepSeek-V4). It still requires the
-    weight to divide evenly into the scale grid (bug 2), which DeepSeek-V3's partial last blocks do not,
-    so there a weight whose grid is the configured block's ceil grid is padded to whole blocks for it
-    and the result cropped back.
+    (installing it on >= 5.10.1 would BREAK ue8m0 checkpoints like DeepSeek-V4). It still derives the
+    block from the scale grid (bug 2), which a partial last block makes wrong: 576 rows under a 5-row
+    grid do not divide at all, and 448 rows under a 4-row grid divide into blocks of 112 instead of 128.
+    So there a weight whose grid is the configured block's ceil grid and that has a partial last block
+    is padded to whole blocks for it and the result cropped back.
     """
     global _FINEGRAINED_FP8_PATCHED, _FP8_DEQUANT_DTYPE
     if target_dtype is not None:
@@ -1722,7 +1723,7 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
                 quantized.dtype not in fp8_dtypes
                 or scales.dim() < 2
                 or tuple(scales.shape[-2:]) != ceil_grid
-                or (rows % ceil_grid[0] == 0 and cols % ceil_grid[1] == 0)
+                or (rows % block[0] == 0 and cols % block[1] == 0)
             ):
                 return _stock_dequantize_one(self, quantized, scales, *args, **kwargs)
             pad_rows, pad_cols = ceil_grid[0] * block[0] - rows, ceil_grid[1] * block[1] - cols

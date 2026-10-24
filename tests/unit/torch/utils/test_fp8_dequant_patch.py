@@ -290,15 +290,18 @@ def test_undoing_the_patch_restores_stock_transformers(pre_5_10_transformers, mo
 
 
 @pytest.mark.parametrize(
-    ("shape", "grid"), [((576, 7168), (5, 56)), ((512, 256), (4, 2))], ids=["partial", "whole"]
+    ("shape", "grid"),
+    [((576, 7168), (5, 56)), ((192, 256), (2, 2)), ((512, 256), (4, 2))],
+    ids=["partial", "partial-dividing-the-grid", "whole"],
 )
 def test_from_5_10_1_its_own_dequant_also_takes_partial_last_blocks(
     pre_5_10_transformers, monkeypatch, shape, grid
 ):
     """Upstream fixed the expert converter there and decodes ue8m0 and FP4 scales, which the override
     does not, so its dequant is kept and only wrapped. A partial last block (DeepSeek-V3's 576-row
-    kv_a_proj_with_mqa under a 5-row grid of 128-row blocks) is padded to whole blocks for it and
-    cropped back; a weight of whole blocks goes to it as is."""
+    kv_a_proj_with_mqa under a 5-row grid of 128-row blocks, or 192 rows that its own dequant would
+    split into two blocks of 96) is padded to whole blocks for it and cropped back; a weight of whole
+    blocks goes to it as is."""
     if Version("5.10.1") > _INSTALLED_TRANSFORMERS:
         pytest.skip("needs transformers' own dequant from 5.10.1")
     monkeypatch.setattr(transformers, "__version__", "5.10.1")
