@@ -450,20 +450,27 @@ def test_what_a_rank_holds_with_the_dense_part_replicated_must_fit(
 
 
 @needs_qwen3_moe_ep_plan
-def test_a_block_fp8_moes_dense_part_is_not_sharded_expert_parallel(
-    run_as, serve, gpu_memory, tmp_path
+@pytest.mark.parametrize(
+    ("num_experts", "quant_method", "ep_size", "match"),
+    [(8, "fp8", 4, "block-fp8"), (2, None, 2, "2 expert-data-parallel replicas")],
+    ids=["block-fp8", "several-ep-groups"],
+)
+def test_a_dense_part_the_expert_parallel_load_cannot_shard_is_replicated(
+    run_as, serve, gpu_memory, tmp_path, num_experts, quant_method, ep_size, match
 ):
-    """The expert-parallel load shards the dense part through DCP, which cannot dequantize block-fp8.
-    Left to decide, the plan replicates it however big; asked to shard it, it refuses. Without
-    expert parallelism the rule does not apply."""
+    """The expert-parallel load cannot shard the dense part of a block-fp8 checkpoint, which DCP
+    cannot dequantize, nor within several EP groups, which the export cannot write. Left to decide,
+    the plan replicates it however big; asked to shard it, it refuses. Without expert parallelism
+    neither rule applies."""
     run_as(4)
-    config = _qwen3_moe(num_experts=8)
-    config.quantization_config = {"quant_method": "fp8"}
+    config = _qwen3_moe(num_experts=num_experts)
+    if quant_method:
+        config.quantization_config = {"quant_method": quant_method}
     serve(config)
     gpu_memory(1)
 
-    assert resolve_distribution_plan(str(tmp_path))[0] == DistributionPlan(4, 4)
-    with pytest.raises(NotImplementedError, match="block-fp8"):
+    assert resolve_distribution_plan(str(tmp_path))[0] == DistributionPlan(4, ep_size)
+    with pytest.raises(NotImplementedError, match=match):
         resolve_distribution_plan(str(tmp_path), dense="fsdp")
     assert resolve_distribution_plan(str(tmp_path), ep_size=1)[0] == DistributionPlan(
         4, dense="fsdp"
@@ -471,13 +478,22 @@ def test_a_block_fp8_moes_dense_part_is_not_sharded_expert_parallel(
 
 
 @needs_qwen3_moe_ep_plan
-def test_the_env_knobs_override_the_automatic_plan(run_as, serve, monkeypatch, tmp_path):
-    monkeypatch.setenv("MODELOPT_EP_DEGREE", "2")
-    monkeypatch.setenv("MODELOPT_FSDP_SIZE", "world")
+@pytest.mark.parametrize(
+    ("knob", "value", "plan"),
+    [
+        ("MODELOPT_EP_DEGREE", "2", DistributionPlan(4, 2)),
+        ("MODELOPT_FSDP_SIZE", "world", DistributionPlan(4, 4, "fsdp")),
+    ],
+    ids=["ep-degree", "fsdp-size"],
+)
+def test_the_env_knobs_override_the_automatic_plan(
+    run_as, serve, monkeypatch, tmp_path, knob, value, plan
+):
+    monkeypatch.setenv(knob, value)
     run_as(4)
     serve(_qwen3_moe(num_experts=8))
 
-    assert resolve_distribution_plan(str(tmp_path))[0] == DistributionPlan(4, 2, "fsdp")
+    assert resolve_distribution_plan(str(tmp_path))[0] == plan
 
 
 @needs_qwen3_moe_ep_plan

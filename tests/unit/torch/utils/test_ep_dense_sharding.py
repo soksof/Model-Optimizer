@@ -157,6 +157,15 @@ def test_dense_weights_resolve_to_meta_and_the_rest_to_the_stock_device(monkeypa
     assert stock_calls == [(expert, (), {"valid_torch_device": True}), (buffer, (), {})] * 2
 
 
+def test_the_dense_load_refuses_a_transformers_without_its_get_device_hook(monkeypatch):
+    """Without the hook the dense part would load whole on every rank, the memory sharding it saves."""
+    for module in _get_device_lookups():
+        monkeypatch.delattr(module, "get_device", raising=False)
+
+    with pytest.raises(RuntimeError, match="get_device"), _ep_dense_meta_load(_is_expert):
+        pass
+
+
 def _get_device_patch():
     return _ep_dense_meta_load(_is_expert), [(m, "get_device") for m in _get_device_lookups()]
 
@@ -270,6 +279,19 @@ def test_each_decoder_layer_is_sharded_around_its_experts(fsdp_mesh):
             assert torch.equal(param.full_tensor(), before[name]), name
         else:
             assert not isinstance(param, DTensor), name
+
+
+def test_a_param_off_the_models_dtype_stays_replicated(fsdp_mesh):
+    """FSDP2 shards one dtype per group, and HF keeps a few params in fp32, as a router: such a
+    param stays replicated, as the pure-FSDP2 wrap leaves it, and its layer still unshards."""
+    model = _MoeLM().to(torch.bfloat16)
+    gate = model.model.layers[0].mlp.gate.float()
+
+    assert _fsdp2_shard_dense(model, fsdp_mesh, model.experts()) == 2
+
+    assert not isinstance(gate.weight, DTensor) and gate.weight.dtype == torch.float32
+    for layer in model.model.layers:
+        layer.unshard()  # FSDP2 checks a group's dtypes here
 
 
 def test_a_layer_holding_only_experts_is_left_unwrapped(fsdp_mesh):

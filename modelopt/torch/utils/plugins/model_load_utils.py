@@ -1333,9 +1333,17 @@ def _decide_distribution(
             f"ep_size={ep_size} must divide the routed experts {hf_config.model_type} shards "
             f"({num_experts})."
         )
-    # The expert-parallel load shards the dense part through Distributed Checkpoint, which cannot
-    # dequantize a block-fp8 checkpoint's F8_E8M0 scales.
-    unshardable = ep_size > 1 and _ckpt_quant_method(hf_config) == "fp8"
+    # Why the expert-parallel load cannot shard the dense part, if it cannot: the export cannot write
+    # it sharded within several expert-data-parallel replicas, and Distributed Checkpoint, which
+    # loads it sharded, cannot dequantize a block-fp8 checkpoint's F8_E8M0 scales.
+    unshardable = None
+    if ep_size > 1 and world_size // ep_size > 1:
+        unshardable = (
+            f"within each of its {world_size // ep_size} expert-data-parallel replicas, a layout "
+            "the export cannot write yet"
+        )
+    elif ep_size > 1 and _ckpt_quant_method(hf_config) == "fp8":
+        unshardable = "from a block-fp8 checkpoint: Distributed Checkpoint cannot dequantize its F8_E8M0 scales"
     if dense == "auto":
         # A rank holds a whole copy of what expert parallelism does not shard, and its 1/ep_size
         # share of the routed experts it does.
@@ -1351,15 +1359,14 @@ def _decide_distribution(
         if too_big and unshardable:
             print(
                 f"{hf_config.model_type}: a rank holding the dense part whole would take more than "
-                f"{_REPLICATED_SHARE:.0%} of a GPU, but a block-fp8 checkpoint's cannot be sharded "
-                "expert-parallel; replicating it.",
+                f"{_REPLICATED_SHARE:.0%} of a GPU, but it cannot be sharded {unshardable}; "
+                "replicating it.",
                 flush=True,
             )
         dense = "fsdp" if too_big and not unshardable else "replicate"
     elif dense == "fsdp" and unshardable:
         raise NotImplementedError(
-            f"The dense part of a block-fp8 {hf_config.model_type} checkpoint cannot be sharded "
-            "expert-parallel: Distributed Checkpoint cannot dequantize its F8_E8M0 scales."
+            f"The dense part of {hf_config.model_type} cannot be sharded {unshardable}."
         )
     return DistributionPlan(world_size, ep_size, dense)
 
@@ -1665,10 +1672,11 @@ def _fsdp2_shard_dense(model: nn.Module, fsdp_mesh, expert_modules) -> int:
     hybrid. ``fsdp_mesh`` is the FULL world (dense shards over every rank, the same ranks the experts are
     EP-sharded over).
 
-    Wraps at the DECODER-LAYER boundary (exactly like the proven pure-FSDP2 path,
-    :func:`_fsdp2_wrap_modules` via HF ``_no_split_modules``) and passes
-    the routed-expert params as ``ignored_params`` so FSDP shards the layer's dense params (attention,
-    layernorms, router) while leaving the experts EP-sharded on the ``ep`` mesh + a2a transport. Wrapping
+    Wraps at the DECODER-LAYER boundary (as the pure-FSDP2 path does, :func:`_fsdp2_wrap_modules` via
+    HF ``_no_split_modules``) and passes the routed-expert params as ``ignored_params`` so FSDP shards
+    the layer's dense params (attention, layernorms, router) while leaving the experts EP-sharded on
+    the ``ep`` mesh + a2a transport. As there, a param off the model's dtype (an fp32 router) stays
+    replicated: FSDP2 shards one dtype per group. Wrapping
     the whole layer (not ``self_attn`` or individual leaves) is essential: ``fully_shard`` swaps a wrapped
     module's class (``Foo`` -> ``FSDPFoo``), and modelopt inspects classes by name/source -- wrapping
     ``self_attn`` breaks ``mtq``'s KV-cache AST registration (``inspect.getsource`` on the synthetic
@@ -1684,7 +1692,7 @@ def _fsdp2_shard_dense(model: nn.Module, fsdp_mesh, expert_modules) -> int:
 
     # Every routed-expert param is EP-sharded on the ``ep`` mesh; FSDP must IGNORE them so it never tries
     # to reshard them onto ``fsdp_mesh``. Ignored params not present in a given layer are simply no-ops.
-    ignored_params: set = set()
+    ignored_params = _off_dtype_params(model)
     for em in expert_modules:
         ignored_params.update(em.parameters(recurse=True))
 
@@ -1826,8 +1834,14 @@ def _ep_dense_meta_load(is_expert):
         mods.add(dm)
     targets = [m for m in mods if hasattr(m, "get_device")]
     if not targets:
-        yield
-        return
+        import transformers
+
+        raise RuntimeError(
+            "Sharding the dense part keeps it off the device during from_pretrained through "
+            f"transformers' get_device, which none of {sorted(m.__name__ for m in mods)} has on "
+            f"transformers {transformers.__version__}. Set MODELOPT_FSDP_SIZE=1 if the dense part "
+            "fits one GPU."
+        )
 
     def _dense_weight(key) -> bool:
         k = str(key)
@@ -1985,12 +1999,12 @@ def load_and_prepare_ep(
         if attn_implementation is not None:
             config_kwargs["attn_implementation"] = attn_implementation
         hf_config = AutoConfig.from_pretrained(ckpt_path, **config_kwargs)
-    if plan.is_fsdp_dense and _ckpt_quant_method(hf_config) == "fp8":
+    quant_method = _ckpt_quant_method(hf_config)
+    if plan.is_fsdp_dense and quant_method == "fp8":
         raise NotImplementedError(
             f"{plan!r}: the dense part of a block-fp8 checkpoint cannot be sharded, since Distributed "
             "Checkpoint cannot dequantize its F8_E8M0 scales. Plan dense='replicate'."
         )
-    quant_method = _ckpt_quant_method(hf_config)
     if quant_method not in _EP_SOURCE_FORMATS:
         # transformers' own quantizer would load it as stored, for PTQ to treat as plain weights.
         dequantized = ", ".join(sorted(f for f in _EP_SOURCE_FORMATS if f))
