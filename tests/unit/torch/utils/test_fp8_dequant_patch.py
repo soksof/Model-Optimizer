@@ -316,8 +316,11 @@ def test_from_5_10_1_its_own_dequant_also_takes_partial_last_blocks(
 
 
 def test_an_expert_converter_it_cannot_fuse_stops_the_load(pre_5_10_transformers, monkeypatch):
-    """Unpatched, every routed expert would load sliced apart from its scales."""
+    """Unpatched, every routed expert would load sliced apart from its scales. The refusal leaves
+    transformers as it was."""
     monkeypatch.setitem(sys.modules, "transformers.core_model_loading", None)
+    stock = _patched_state()
 
     with pytest.raises(RuntimeError, match="could not fuse transformers' expert dequant"):
         model_load_utils._patch_finegrained_fp8_dequant()
+    assert _patched_state() == stock
