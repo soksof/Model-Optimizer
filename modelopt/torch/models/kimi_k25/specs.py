@@ -15,8 +15,12 @@
 
 """kimi_k25 specs (HF model type ``kimi_k25``).
 
-Kimi-K2.7: the compressed-expert sibling of ``kimi_vl`` -- same swap to a native
-deepseek_v3 language model, plus on-the-fly decompression of its packed experts at load.
+Kimi-K2.5 (Kimi-K2.6 and Kimi-K2.7-Code share its model type): the compressed-expert sibling of
+``kimi_vl`` -- same swap to a native deepseek_v3 language model, plus on-the-fly decompression of
+its packed experts at load.
+
+Only the expert-parallel section is registered under ``kimi_k25``: the MoE and export sections stay
+``deepseek_v3``'s, so lookups by ``kimi_k25`` find neither yet. Sharing them is left to a follow-up.
 """
 
 from ..deepseek_v3.specs import BASE_MODEL_EP_PLAN

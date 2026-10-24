@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Expert-parallel adapter for Kimi-K2.7 (``kimi_k25``), a remote-code VLM on DeepSeek-V3.
+"""Expert-parallel adapter for Kimi-K2.5 (``kimi_k25``), a remote-code VLM on DeepSeek-V3.
 
 The adapter rebuilds the language model as transformers' native deepseek_v3 and installs the
 on-the-fly expert decompressor. The checkpoint's remote code is not available here, so the tests
@@ -45,16 +45,17 @@ from modelopt.torch.models.kimi_k25 import ep as kimi_k25
 from modelopt.torch.utils.moe import _routed_expert_keys, check_distributed_support
 
 QUANT = {"quant_method": "compressed-tensors", "format": "pack-quantized"}
-REMOTE = "transformers_modules.Kimi_hyphen_K2_dot_7.0123abcd"  # how the loader names remote code
+REMOTE = "transformers_modules.Kimi_hyphen_K2_dot_5.0123abcd"  # how the loader names remote code
 
 
 class _RemoteTextConfig(PretrainedConfig):
-    """Stands in for the remote DeepSeek-V3 config Kimi-K2.7 bundles as its ``text_config``."""
+    """Stands in for the remote DeepSeek-V3 config Kimi-K2.5 bundles as its ``text_config``."""
 
     model_type = "kimi_k2_remote_text"
 
 
 def _vlm_config():
+    """Kimi-K2.5's config: the compressed-tensors scheme sits only on the text config."""
     text = _RemoteTextConfig(
         hidden_size=64,
         num_hidden_layers=2,
@@ -63,7 +64,7 @@ def _vlm_config():
         auto_map={"AutoConfig": "configuration_deepseek.DeepseekV3Config"},
         quantization_config=QUANT.copy(),
     )
-    return SimpleNamespace(text_config=text, quantization_config=QUANT.copy())
+    return SimpleNamespace(text_config=text)
 
 
 @pytest.fixture
@@ -86,13 +87,14 @@ def remote(monkeypatch):
 def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkeypatch, remote):
     """The text config becomes transformers' own ``DeepseekV3Config`` (no remote ``auto_map``, no
     stale ``quantization_config``) with an EP plan for the fused experts, naming the experts the
-    spec states for a run that skips prepare; the decompressor is installed while the VLM config
-    still carries the compressed-tensors scheme; the remote-code staging shim is left installed."""
+    spec states for a run that skips prepare; the decompressor is installed while the text config
+    it replaces still carries the compressed-tensors scheme; the remote-code staging shim is left
+    installed."""
     installs = []
     monkeypatch.setattr(
         _onfly_decompress,
         "install_onfly_decompress",
-        lambda cfg: installs.append(getattr(cfg, "quantization_config", None)),
+        lambda cfg: installs.append(_onfly_decompress._find_quantization_config(cfg)),
     )
     staging = dmu.get_cached_module_file
     config = _vlm_config()
@@ -131,6 +133,27 @@ def test_prepare_with_a_checkpoint_points_the_remote_modeling_at_native_deepseek
     ]
     assert remote.DeepseekV3ForCausalLM is DeepseekV3ForCausalLM
     assert bystander.DeepseekV3ForCausalLM is remote_lm
+
+
+def test_a_checkpoint_the_decompressor_refuses_is_refused_before_anything_changes(
+    monkeypatch, remote
+):
+    """The decompressor refuses a checkpoint it cannot decompress as it loads before prepare
+    replaces the language model's config or wraps the loader's remote-code staging."""
+
+    def refuse(cfg):
+        raise NotImplementedError("the checkpoint has 2 compressed-tensors config groups")
+
+    monkeypatch.setattr(_onfly_decompress, "install_onfly_decompress", refuse)
+    staging = dmu.get_cached_module_file
+    config = _vlm_config()
+    text = config.text_config
+
+    with pytest.raises(NotImplementedError, match="config groups"):
+        kimi_k25.prepare(config, ckpt_path="/ckpt", trust_remote_code=True)
+
+    assert config.text_config is text
+    assert dmu.get_cached_module_file is staging
 
 
 def test_a_transformers_too_old_to_decompress_is_refused_before_prepare(monkeypatch):

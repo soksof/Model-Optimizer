@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DP=EP a2a support for Kimi-K2.7-Code (``kimi_k25``).
+"""DP=EP a2a support for Kimi-K2.5 (``kimi_k25``).
 
 a remote-code VLM whose text backbone is a DeepSeek-V3 variant with compressed-tensors-compressed experts.
+Kimi-K2.6 and Kimi-K2.7-Code ship the same model type and modeling classes.
 
 The challenge: Kimi's bundled ``modeling_deepseek.py`` defines ``DeepseekV3MoE`` as an
 ``nn.ModuleList`` of per-expert ``DeepseekV3MLP`` (separate ``gate_proj`` / ``up_proj`` /
@@ -58,7 +59,7 @@ from ..kimi_vl.ep import _drop_tie_weights_kwargs, _install_compat_import_shims
 
 
 def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool = False, **_):
-    """Load Kimi-K2.7's language model as the transformers-native deepseek_v3.
+    """Load Kimi-K2.5's language model as the transformers-native deepseek_v3.
 
     Swap text_config to native deepseek_v3 + monkey-patch Kimi's modeling to use the native
     DeepseekV3ForCausalLM + apply the EP plan + install the on-the-fly expert decompressor.
@@ -85,24 +86,25 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
             "load it with trust_remote_code=True."
         )
 
+    # 1. Install on-the-fly compressed-tensors expert decompressor. Operates on transformers-native
+    #    deepseek_v3's per-expert WeightConverter (which fuses per-expert .weight tensors into the
+    #    3-D gate_up_proj/down_proj Parameters). Format-agnostic; driven by checkpoint's
+    #    quantization_config, which Kimi-K2.5 carries only on the text_config step 2 replaces. It
+    #    goes first, so a checkpoint it refuses leaves everything as it was.
+    _onfly_decompress.install_onfly_decompress(hf_config)
+
     # transformers stages only 1-hop relative imports; Kimi's remote code is 2 hops deep. Install the
     # full-closure staging shim BEFORE any remote-code load (this plugin's get_class_from_dynamic_module
     # below, and from_pretrained later in load_and_prepare_ep).
     _install_compat_import_shims()
     stage_full_remote_closure()
 
-    # 1. Replace text_config with a transformers-native DeepseekV3Config built from the same fields.
+    # 2. Replace text_config with a transformers-native DeepseekV3Config built from the same fields.
     #    Kimi's __init__ passes config.text_config to DeepseekV3ForCausalLM; the native class rejects
     #    Kimi's custom config subclass. to_native_backbone_config also drops auto_map +
     #    quantization_config so transformers builds the native modeling instead of re-routing back
     #    to Kimi's remote code via auto_map.
     hf_config.text_config = _onfly_decompress.to_native_backbone_config(hf_config)
-
-    # 2. Install on-the-fly compressed-tensors expert decompressor. Operates on transformers-native
-    #    deepseek_v3's per-expert WeightConverter (which fuses per-expert .weight tensors into the
-    #    3-D gate_up_proj/down_proj Parameters). Format-agnostic; driven by checkpoint's
-    #    quantization_config.
-    _onfly_decompress.install_onfly_decompress(hf_config)
 
     # 3. Apply the EP plan to the now-native text_config. transformers' post_init walks children
     #    and prefixes their _ep_plan onto the parent's: text_config's plan ends up at the VLM root

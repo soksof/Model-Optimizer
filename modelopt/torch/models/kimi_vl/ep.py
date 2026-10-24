@@ -39,8 +39,8 @@ Solution (mirrors kimi_k25):
      from the bundled code. Native deepseek_v3's per-expert WeightConverter fuses the checkpoint's
      per-expert ``.weight`` tensors into the 3-D params on load (no decompressor -- weights are bf16).
 
-Version: matches Kimi-K2.7 -- validated on transformers 5.9.0 (has the EP framework + the legacy
-symbols the remote code imports). The compat shims make it tolerant of a few later drops too.
+Version: no floor beyond the EP framework's 5.6; validated on transformers 5.9.0. The compat shims
+stand in for the symbols the remote code imports that later releases dropped.
 """
 
 import sys

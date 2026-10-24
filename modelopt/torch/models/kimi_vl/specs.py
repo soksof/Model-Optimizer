@@ -18,6 +18,9 @@
 Kimi-VL-A3B: a remote-code VLM whose text backbone is a Moonlight MoE. Its bundled
 modeling builds the language model from per-expert Linears, which the EP machinery cannot shard, so
 ``ep.py`` swaps in the transformers-native deepseek_v3 language model.
+
+Only the expert-parallel section is registered under ``kimi_vl``: the MoE and export sections stay
+``deepseek_v3``'s, so lookups by ``kimi_vl`` find neither yet. Sharing them is left to a follow-up.
 """
 
 from ..deepseek_v3.specs import BASE_MODEL_EP_PLAN
