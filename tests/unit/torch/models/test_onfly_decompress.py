@@ -50,14 +50,8 @@ PACKED = ("weight_packed", "weight_scale", "weight_shape")  # what pack-quantize
 @pytest.fixture
 def restore_loader_hooks(monkeypatch):
     """Undo the process-wide transformers hooks the decompressor installs."""
-    for owner, name in (
-        (WeightConverter, "add_tensor"),
-        (WeightConverter, "materialize_tensors"),
-        (cml, "_materialize_copy"),
-        (mu, "get_model_conversion_mapping"),
-    ):
+    for owner, name in ((cml, "_materialize_copy"), (mu, "get_model_conversion_mapping")):
         monkeypatch.setattr(owner, name, getattr(owner, name))
-    monkeypatch.setattr(onfly, "_EXPERT_ORDER", {})
 
 
 class _ScaledCompressor:
@@ -119,6 +113,21 @@ def test_non_weight_sources_are_kept_verbatim():
     assert sorted(p for p in rewritten.source_patterns if "weight" in p) == sorted(
         f"mlp.experts.*.gate_proj.{name}$" for name in PACKED
     )
+
+
+def test_a_rewritten_converter_keeps_the_scope_transformers_set_on_it():
+    """transformers scopes a sub-model's converters (a VLM's language model) once it has built them;
+    the rewrite keeps whichever of those fields this release has."""
+    _, down = _stock_expert_converters()
+    down = copy.deepcopy(down)
+    fields = {"scope_prefix": "language_model", "base_model_prefix": "model", "force_cpu": True}
+    fields = {name: value for name, value in fields.items() if hasattr(type(down), name)}
+    for name, value in fields.items():
+        setattr(down, name, value)
+
+    rewritten = onfly._compressedify(down, _ScaledCompressor, None, PACKED)
+
+    assert {name: getattr(rewritten, name) for name in fields} == fields
 
 
 # ----------------------------------------------------------------- decompressing during the load
@@ -199,21 +208,6 @@ def test_only_owned_experts_and_stored_siblings_reach_the_compressor():
 
 
 @pytest.mark.usefixtures("restore_loader_hooks")
-def test_experts_merge_in_numeric_not_lexicographic_order():
-    """Checkpoint keys iterated as strings yield experts 0, 1, 10, 11, 2, ...; the fused tensor must
-    still hold expert i in slot i (unfixed, expert 10 lands in slot 2)."""
-    onfly._install_numeric_expert_ordering()
-    _, down = _stock_expert_converters()
-    keys = {e: f"model.layers.0.mlp.experts.{e}.down_proj.weight" for e in range(12)}
-    checkpoint = {keys[e]: torch.full((2, 3), float(e)) for e in sorted(keys, key=str)}
-    assert list(checkpoint)[2] == keys[10]  # the order the fix exists for
-
-    fused = _load([down], checkpoint)["model.layers.0.mlp.experts.down_proj"]
-
-    assert fused[:, 0, 0].tolist() == [float(e) for e in range(12)]
-
-
-@pytest.mark.usefixtures("restore_loader_hooks")
 def test_integer_checkpoint_tensors_keep_their_dtype_on_load():
     """Without a quantizer the loader casts every tensor to the model's float dtype, which destroys
     packed weights, shapes and zero-points. Integers stay integers; floats are still cast, and
@@ -253,7 +247,7 @@ def test_install_rewrites_only_the_per_expert_weight_converters(monkeypatch):
     calls = []
 
     def stock_mapping(model, key_mapping=None, hf_quantizer=None, add_legacy=True):
-        calls.append((model, key_mapping, hf_quantizer))
+        calls.append((model, key_mapping, hf_quantizer, add_legacy))
         return list(stock)
 
     compression = (_ScaledCompressor, None, PACKED, "stub-format")
@@ -263,10 +257,10 @@ def test_install_rewrites_only_the_per_expert_weight_converters(monkeypatch):
     onfly.install_onfly_decompress(config)
     model = SimpleNamespace(config=config)
 
-    # positionally, the way from_pretrained calls it
-    out = mu.get_model_conversion_mapping(model, {"old": "new"}, "quantizer")
+    # positionally, the way from_pretrained calls it, and a later parameter too
+    out = mu.get_model_conversion_mapping(model, {"old": "new"}, "quantizer", False)
 
-    assert calls == [(model, {"old": "new"}, "quantizer")]
+    assert calls == [(model, {"old": "new"}, "quantizer", False)]
     assert len(out) == len(stock)
     assert all(kept is original for kept, original in zip(out[:3], stock[:3]))
     assert [conv.source_patterns[0] for conv in out[3:]] == [
@@ -294,12 +288,7 @@ def test_installing_twice_wraps_the_loader_once(monkeypatch):
     monkeypatch.setattr(onfly, "_read_compression", read)
 
     def hooks():
-        return (
-            mu.get_model_conversion_mapping,
-            WeightConverter.add_tensor,
-            WeightConverter.materialize_tensors,
-            cml._materialize_copy,
-        )
+        return mu.get_model_conversion_mapping, cml._materialize_copy
 
     onfly.install_onfly_decompress(SimpleNamespace())
     installed = hooks()

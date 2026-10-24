@@ -13,39 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""On-the-fly decompression of compressed-tensors quantized MoE experts into the transformers-5.x
-fused-experts layout, DURING from_pretrained — so a2a PTQ can run on the ORIGINAL compressed
-checkpoint with no decompressed intermediate on disk, EP-sharded (each rank decompresses only its
-own experts).
+"""Decompress a compressed-tensors MoE checkpoint's experts as ``from_pretrained`` loads them.
 
-FORMAT-AGNOSTIC. The dequant math is delegated to the ``compressed_tensors`` library and driven
-entirely by the checkpoint's own ``quantization_config`` (the ``format`` string + the per-group
-``QuantizationArgs``). Any format the library registers works with ZERO per-format code here:
-``pack-quantized`` (INT, symmetric or asymmetric, any bit-width / group_size / strategy),
-``nvfp4-pack-quantized`` (FP4 + FP8 block scale + FP32 global), ``naive-quantized`` /
-``float-quantized`` / ``int-quantized`` (unpacked FP8/INT), etc. The two universal hooks the library
-exposes per format are all we need:
-  - ``compressor.compression_param_names(scheme)`` -> the exact set of stored keys for one weight
-    (e.g. ``("weight_packed","weight_scale","weight_shape")`` for pack, ``("weight","weight_scale")``
-    for float), i.e. which per-expert sibling tensors to pull.
-  - ``compressor.decompress({<those keys>: tensor}, scheme)["weight"]`` -> the dequantized weight.
-``compressed_tensors`` must be importable at load time, and transformers must be 5.8 or newer: earlier
-releases' ``Concatenate`` looks up every source pattern, including the sibling keys the decompression
-already consumed.
+Each rank decompresses only its own experts into the transformers 5.x fused-experts layout, so
+expert-parallel PTQ runs on the original compressed checkpoint, with no decompressed copy on disk.
+The math is the ``compressed_tensors`` library's, driven by the checkpoint's ``quantization_config``:
+``compressor.compression_param_names(scheme)`` names the stored keys of one weight, and
+``compressor.decompress(...)["weight"]`` dequantizes them, so every format the library registers
+works. It needs ``compressed_tensors`` importable and transformers 5.8 or newer (earlier releases'
+``Concatenate`` looks up the sibling keys the decompression consumed).
 
-The model-specific knobs remain parameters; defaults target moonshotai/Kimi-K2.7-Code (DeepSeek-V3
-backbone):
-  - install_onfly_decompress(hf_config)         — auto-detects format + quant args from the config
-  - to_native_backbone_config(vlm_config, ...)  — build the native backbone config
-
-Mechanism (mirrors transformers' FP8 quantizer ``update_weight_conversions``): the fused-MoE model
-already ships a ``WeightConverter`` that fuses per-expert ``gate/up/down_proj.weight`` -> 3-D
-``gate_up_proj``/``down_proj`` via ``MergeModulelist``+``Concatenate``. We rewrite those converters so
-each ``.weight`` source becomes the checkpoint's actual stored keys for that weight
-(``compression_param_names``), and PREPEND a ``DecompressExperts`` op that pairs those per expert and
-dequantizes -> bf16 BEFORE the merge/concat collapse the per-expert structure.
-``install_onfly_decompress()`` monkeypatches ``get_model_conversion_mapping``, for the model built from
-the config it is given: every other model ``from_pretrained`` loads keeps its stock converters.
+:func:`install_onfly_decompress` rewrites the per-expert converters ``get_model_conversion_mapping``
+returns, for the model built from the config it marks: each ``.weight`` source becomes the stored
+keys, and a ``DecompressExperts`` op ahead of the merge dequantizes each expert.
+:func:`to_native_backbone_config` builds a VLM's transformers-native backbone config.
 """
 
 import torch
@@ -142,21 +123,13 @@ def _read_compression(hf_config):
 
 
 def _make_op_class(compressor, scheme, param_names):
-    """Build the per-expert decompress op lazily (so this module imports without transformers present),
-    bound to a compressed_tensors compressor + scheme + the checkpoint's stored param names. The FIRST
-    param name is the "anchor" (the source key the decompressed list is emitted under, replacing the
-    original ``.weight`` so the downstream MergeModulelist/Concatenate fuse exactly as uncompressed).
+    """Build the per-expert decompress op, bound to a compressor, its scheme and the stored keys.
 
-    NOTE: ``DecompressExperts`` subclasses ``MergeModulelist`` so that it shards experts AT LOAD. The
-    transformers loader (``convert_and_load_state_dict_in_model``) only computes the per-expert
-    ``shard_index`` (``tensor_idx``) when ``isinstance(converter.operations[0], MergeModulelist)``; that
-    ``tensor_idx`` is what makes ``GroupedGemmParallel.shard_tensor`` keep ONLY this rank's local experts
-    (returning ``None`` for the rest). If our op were a plain ``ConversionOps`` prepended before the
-    original ``MergeModulelist``, ``operations[0]`` would not match, ``tensor_idx`` would be ``None``, and
-    every rank would materialize + decompress ALL experts (garbled, and a ~device-max transient -> OOM at
-    scale, e.g. Kimi-K2.7-Code EP32). Subclassing keeps ``operations[0]`` a ``MergeModulelist`` instance so
-    per-expert sharding fires; we still override ``convert`` to decompress (the ``dim``/merge behavior of
-    the base class is unused -- the ORIGINAL ``MergeModulelist`` later in the chain does the stacking)."""
+    The first stored key is the anchor the decompressed experts are emitted under, in place of the
+    ``.weight`` the downstream merge expects. The op subclasses ``MergeModulelist`` only because the
+    loader shards experts at load (``tensor_idx``, so non-local experts arrive as ``None``) only when
+    a converter's first op is one; the original merge later in the chain still does the stacking.
+    """
     from transformers.core_model_loading import MergeModulelist
 
     anchor = "." + param_names[0]
@@ -237,54 +210,17 @@ def _compressedify(conv, compressor, scheme, param_names):
             by_pname[param_names[0]].append(p)  # leave non-weight sources as-is (none expected)
     new_sources = [s for pn in param_names for s in by_pname[pn]]
     tgt = getattr(conv, "_original_target_patterns", conv.target_patterns)
-    return WeightConverter(
+    new = WeightConverter(
         source_patterns=new_sources,
         target_patterns=tgt,
         operations=[DecompressExperts(), *conv.operations],
     )
-
-
-# id(converter) -> {source_pattern: [expert indices in append order]}; used to re-sort experts numerically.
-_EXPERT_ORDER: dict = {}
-
-
-def _install_numeric_expert_ordering():
-    """Patch WeightConverter.add_tensor / materialize_tensors so per-expert tensors are merged in NUMERIC index order.
-
-    The loader appends in checkpoint-iteration order, which is LEXICOGRAPHIC for many indices (0,1,10,100,...,2,...) —
-    that scrambles fused-expert slots. A no-op for numerically-ordered checkpoints.
-    """
-    import re as _re
-
-    from transformers.core_model_loading import WeightConverter
-
-    if getattr(WeightConverter.add_tensor, "_onfly_patched", False):
-        return
-    orig_add = WeightConverter.add_tensor
-    orig_mat = WeightConverter.materialize_tensors
-
-    def add_tensor(self, target_key, source_key, source_pattern, future):
-        orig_add(self, target_key, source_key, source_pattern, future)
-        m = _re.search(r"experts\.(\d+)\.", source_key)
-        if m is not None:
-            _EXPERT_ORDER.setdefault(id(self), {}).setdefault(source_pattern, []).append(
-                int(m.group(1))
-            )
-
-    def materialize_tensors(self):
-        order = _EXPERT_ORDER.pop(id(self), None)
-        if order:
-            for pat, idxs in order.items():
-                lst = self.collected_tensors.get(pat)
-                if lst is not None and len(lst) == len(idxs):
-                    self.collected_tensors[pat] = [
-                        f for _, f in sorted(zip(idxs, lst), key=lambda x: x[0])
-                    ]
-        return orig_mat(self)
-
-    setattr(add_tensor, "_onfly_patched", True)
-    WeightConverter.add_tensor = add_tensor
-    WeightConverter.materialize_tensors = materialize_tensors
+    # What else transformers sets on a converter when it maps a model -- the sub-model scope it
+    # matches keys under, whether it loads on the CPU -- whichever of them this release has.
+    for attr in ("scope_prefix", "base_model_prefix", "force_cpu"):
+        if hasattr(conv, attr):
+            setattr(new, attr, getattr(conv, attr))
+    return new
 
 
 def _install_keep_int_native():
@@ -294,23 +230,17 @@ def _install_keep_int_native():
     bit pattern of packed weights (`weight_packed`), shapes (`weight_shape`), zero-points and g_idx. Floats (the scale,
     global scale, dense weights) still cast normally.
     """
-    import torch
     import transformers.core_model_loading as cml
 
     if getattr(cml._materialize_copy, "_onfly_patched", False):
         return
+    orig = cml._materialize_copy
 
     def _materialize_copy(tensor, device=None, dtype=None):
         t = tensor[...]
-        if (
-            dtype is not None
-            and not t.is_floating_point()
-            and torch.empty((), dtype=dtype).is_floating_point()
-        ):
+        if dtype is not None and dtype.is_floating_point and not t.is_floating_point():
             dtype = None  # keep packed/shape/zero-point/g_idx integers native
-        if dtype is not None or device is not None:
-            t = t.to(device=device, dtype=dtype)
-        return t
+        return orig(t, device=device, dtype=dtype)
 
     setattr(_materialize_copy, "_onfly_patched", True)
     cml._materialize_copy = _materialize_copy
@@ -348,6 +278,7 @@ def install_onfly_decompress(hf_config):
     import transformers.modeling_utils as mu
     from transformers.core_model_loading import WeightConverter
 
+    from modelopt.torch.utils import print_rank_0
     from modelopt.torch.utils.moe import require_transformers
 
     installed = getattr(mu.get_model_conversion_mapping, "_onfly_compression", None)
@@ -373,13 +304,12 @@ def install_onfly_decompress(hf_config):
         )
     compressor, scheme, param_names, fmt = compression
     require_transformers("5.8", "on-the-fly compressed-tensors decompression")
-    _install_numeric_expert_ordering()
     _install_keep_int_native()
     orig = mu.get_model_conversion_mapping
 
-    def patched(model, key_mapping=None, hf_quantizer=None, *a, **k):
-        convs = orig(model, key_mapping=key_mapping, hf_quantizer=hf_quantizer, *a, **k)
-        config = getattr(model, "config", None)
+    def patched(*args, **kwargs):
+        convs = orig(*args, **kwargs)
+        config = getattr(args[0] if args else kwargs["model"], "config", None)
         if getattr(config, _MARK, None) is None:
             # Not the compressed checkpoint: rewritten, an uncompressed MoE's experts would match no
             # stored key and load newly initialized without an error.
@@ -401,8 +331,7 @@ def install_onfly_decompress(hf_config):
     setattr(patched, "_onfly_compression", compression)
     mu.get_model_conversion_mapping = patched
     _mark(hf_config, fmt)
-    print(
+    print_rank_0(
         f"[onfly_decompress] installed: compressed_tensors '{fmt}' fused-MoE experts decompress "
-        f"(stored params={param_names}) -> bf16 during from_pretrained",
-        flush=True,
+        f"(stored params={param_names}) -> bf16 during from_pretrained"
     )

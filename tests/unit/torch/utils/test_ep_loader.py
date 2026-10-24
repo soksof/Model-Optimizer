@@ -400,7 +400,9 @@ def test_a_compressed_checkpoint_a_spec_decompresses_as_it_loads_passes(monkeypa
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
     monkeypatch.setattr(model_load_utils, "_resolve_checkpoint_dir", resolve)
-    config = SimpleNamespace(quantization_config={"quant_method": "compressed-tensors"})
+    config = SimpleNamespace(
+        quantization_config={"quant_method": "compressed-tensors"}, base_model_ep_plan=_EP_PLAN
+    )
     plan = DistributionPlan(2, ep_size=2)
 
     with pytest.raises(NotImplementedError, match="cannot dequantize"):
