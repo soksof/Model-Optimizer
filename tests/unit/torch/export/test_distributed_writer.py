@@ -114,6 +114,7 @@ def _llama_config():
         ("5GB", 5 * 10**9),
         ("1GiB", 2**30),
         (" 1.5 mb ", 1_500_000),
+        ("5Gb", 5 * 10**9),  # bytes, as the streaming export reads it; transformers reads bits
         ("123", 123),
         (4096, 4096),
         ("5B", ValueError),
@@ -224,8 +225,13 @@ def _padded_shard(mesh):
             "cannot materialize",
         ),
         (_padded_shard, "do not tile their global shape"),
+        # Empty, so there is nothing to assemble, but in a layout it would refuse a non-empty one in.
+        (
+            lambda mesh: distribute_tensor(torch.zeros(0, 4), mesh, [Shard(1)]),
+            "cannot materialize",
+        ),
     ],
-    ids=["shard1", "2d-mesh", "padded"],
+    ids=["shard1", "2d-mesh", "padded", "empty-shard1"],
 )
 def test_materialize_owned_rejects_a_tensor_it_cannot_assemble(gloo_world_of_one, build, match):
     """Refused before anything moves, rather than assembled wrong."""
@@ -250,26 +256,33 @@ def _refusing_materialize_job(rank, world_size, case):
             # Rank 1 cast its shard: the transfer's byte counts would not match.
             dtype = torch.float32 if rank == 0 else torch.bfloat16
             local, placement, gshape = torch.zeros(2, 4, dtype=dtype), Shard(0), (4, 4)
-        else:
+        elif case == "global-shape":
             # A rewrap that re-inferred the global shape per rank: rank 0's own view tiles, rank 1's not.
             local, placement, gshape = torch.zeros(2, 4), Shard(0), (4 if rank == 0 else 3, 4)
+        else:
+            # An expert, which each rank writes as it holds it: only rank 1's is still a DTensor.
+            local, placement, gshape = torch.zeros(2, 4), Shard(0), (4, 4)
         w = DTensor.from_local(
             local, mesh, [placement], run_check=False, shape=torch.Size(gshape), stride=(4, 1)
         )
+        if case == "expert" and rank == 0:
+            w = w.to_local()
     try:
         with bounded_collectives():
-            _materialize_owned({"w": w}, set(), rank, world_size)
+            _materialize_owned({"w": w}, {"w"} if case == "expert" else set(), rank, world_size)
     except RuntimeError as error:
         raised = str(error)
     else:
         raised = "no error"
-    match = {"global-shape": "do not tile their global shape", "dtype": "different dtype"}.get(
-        case, "cannot materialize"
-    )
+    match = {
+        "global-shape": "do not tile their global shape",
+        "dtype": "different dtype",
+        "expert": "still DTensors",
+    }.get(case, "cannot materialize")
     assert match in raised, raised
 
 
-@pytest.mark.parametrize("case", ["smaller-mesh", "placement", "global-shape", "dtype"])
+@pytest.mark.parametrize("case", ["smaller-mesh", "placement", "global-shape", "dtype", "expert"])
 def test_materialize_owned_refuses_on_every_rank(cpu_dist_workers, case):
     """Every rank refuses, the ranks whose own view looks fine included, instead of waiting in a
     collective the refusing rank never joins."""
@@ -398,6 +411,15 @@ def test_write_even_shards_fails_loudly_when_no_rank_has_anything_to_write(
         _write_even_shards({}, tmp_path, "1MB", 0, 1)
 
 
+def test_write_even_shards_writes_both_names_of_a_shared_tensor(gloo_world_of_one, tmp_path):
+    """Both names of one CPU tensor are written, though ``save_file`` refuses shared memory."""
+    shared = torch.arange(4.0)
+
+    _write_even_shards({"a": shared, "b": shared}, tmp_path, "1MB", 0, 1)
+
+    _assert_byte_identical(_load_checkpoint(tmp_path), {"a": shared, "b": shared})
+
+
 def _one_rank_fails_job(rank, world_size, tmp_dir, fails):
     failing_rank, target = {
         "dir": (1, "pathlib.Path.mkdir"),
@@ -447,4 +469,7 @@ def _cross_rank_collision_job(rank, world_size, tmp_dir):
 
 
 def test_a_name_two_ranks_both_write_fails_the_write_on_every_rank(cpu_dist_workers, tmp_path):
+    """Before any rank writes a shard, which a retry into the directory would otherwise inherit."""
     cpu_dist_workers.run(_cross_rank_collision_job, tmp_dir=tmp_path)
+
+    assert not list(tmp_path.glob("*.safetensors"))

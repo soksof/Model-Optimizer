@@ -22,6 +22,7 @@ replicated across ranks.
 
 import json
 import warnings
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -31,7 +32,9 @@ import torch.nn as nn
 def _size_to_bytes(size: "str | int") -> int:
     """Parse an HF-style shard-size string (``"5GB"``, ``"500MB"``, ``"1GiB"``) to bytes.
 
-    Matches transformers' decimal convention (GB == 10**9). Bare ints pass through.
+    ``GB`` is decimal (10**9) and ``GiB`` binary, as in transformers. A unit in any case means bytes,
+    as in the streaming export's ``_parse_shard_size``; transformers reads a lowercase ``b`` as bits.
+    Bare ints pass through.
     """
     if isinstance(size, int):
         return size
@@ -203,7 +206,8 @@ def _gather_shard0_to_owners(
 def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: int) -> None:
     """Make every tensor in ``local_sd`` WHOLE and owned by exactly one rank, in place.
 
-    Experts are already disjoint per rank (each rank split its own shard). Every dense fqn is
+    Experts are already whole, plain and disjoint per rank (each rank split its own shard); one that
+    is still a DTensor is refused. Every dense fqn is
     assigned to ONE rank -- largest-first onto the currently-lightest rank, seeded with each rank's
     expert bytes so the per-rank totals level out -- and then moved there by the cheapest transport
     its layout allows (see :func:`_gather_shard0_to_owners`). Keys this rank does not own are dropped.
@@ -229,17 +233,15 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
         v = local_sd[k]
         if not isinstance(v, DTensor):
             plain.append(k)
-        elif v.numel() == 0:
+        elif all(p.is_replicate() for p in v.placements):
+            replicated.append(k)
+        elif _is_full_world_shard0(v, world, _mesh_memo):
             # A zero-element global tensor (e.g. a projection that is absent in some layers, so its
             # dim 0 is 0) cannot be reassembled from shards: FSDP2 still hands one rank a PADDED
             # 1-row chunk while the rest get genuinely empty ones, so concatenating would fabricate
             # a row the global tensor does not have. There is no data to move -- the owner emits the
             # empty tensor directly.
-            empty0.append(k)
-        elif all(p.is_replicate() for p in v.placements):
-            replicated.append(k)
-        elif _is_full_world_shard0(v, world, _mesh_memo):
-            shard0.append(k)
+            (empty0 if v.numel() == 0 else shard0).append(k)
         else:
             unsupported.append((k, str(v.placements), v.device_mesh.ndim))
 
@@ -256,6 +258,7 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
         {k: tuple(local_sd[k].shape) for k in shard0},
         [(k, pl, f"mesh.ndim={nd}") for k, pl, nd in unsupported[:3]],
         {k: str(local_sd[k].dtype) for k in shard0},
+        [k for k in expert_keys if isinstance(local_sd[k], DTensor)][:3],
     )
     meta: list = [None] * world
     dist.all_gather_object(meta, my_meta)
@@ -277,6 +280,14 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
         raise RuntimeError(
             f"rank {rank}: tensor(s) have a placement the no-gather export cannot materialize; "
             f"first few per rank: {unsupported_by_rank}"
+        )
+    # Experts skip the classification above and go to the write as they are, which cannot serialize
+    # a DTensor: refuse one here, before any rank moves or writes anything.
+    sharded_experts = {r: m[6] for r, m in enumerate(meta) if m[6]}
+    if sharded_experts:
+        raise RuntimeError(
+            f"rank {rank}: expert tensor(s) are still DTensors, but each rank writes its experts as "
+            f"it holds them; first few per rank: {sharded_experts}"
         )
     expert_bytes = [m[1] for m in meta]
     all_shapes = [m[2] for m in meta]
@@ -443,13 +454,24 @@ def _write_even_shards(
     fits = sum(size for size in sizes.values() if size <= max_bytes)
     my_files = _even_bins(write_keys, sizes, max(1, math.ceil(fits / max_bytes)), max_bytes)
 
-    def count_mine() -> list[int]:
+    def plan_mine() -> list:
         # The directory can fail to appear on one rank alone (its node's filesystem), so it is
         # created inside the first collective, which carries that failure to every rank.
         export_dir.mkdir(parents=True, exist_ok=True)
-        return [len(my_files)]
+        return [(len(my_files), write_keys)]
 
-    counts = all_reduce("shard counts", count_mine, _in_rank_order)
+    planned = all_reduce("shard plan", plan_mine, _in_rank_order)
+    # The reverse conversion checks for rename collisions, but only within one rank's slice. A
+    # collision ACROSS ranks would be silently swallowed by the index's dict update and ship a
+    # checkpoint quietly missing a tensor, so every rank refuses it here, before any file is written.
+    names = Counter(k for _, keys in planned for k in keys)
+    collisions = sorted(k for k, n in names.items() if n > 1)
+    if collisions:
+        raise RuntimeError(
+            f"tensor name collision across ranks: {len(collisions)} name(s) held by more than one "
+            f"rank; first few: {collisions[:5]}"
+        )
+    counts = [n for n, _ in planned]
     n_total = sum(counts)
     if n_total == 0:
         raise RuntimeError(
@@ -463,7 +485,17 @@ def _write_even_shards(
         my_bytes = 0
         for i, keys in enumerate(my_files):
             fname = f"model-{base + i + 1:05d}-of-{n_total:05d}.safetensors"
-            tensors = {k: local_sd[k].detach().to("cpu").contiguous() for k in keys}
+            tensors: dict = {}
+            ptrs: set = set()
+            for k in keys:
+                t = local_sd[k].detach().to("cpu").contiguous()
+                # save_file refuses tensors sharing memory, and neither call copies a tensor that is
+                # already on the CPU and contiguous, so two names for one tensor arrive aliased. Copy
+                # rather than drop one: every name has to reach the index.
+                if t.data_ptr() in ptrs:
+                    t = t.clone()
+                ptrs.add(t.data_ptr())
+                tensors[k] = t
             save_file(tensors, str(export_dir / fname), metadata={"format": "pt"})
             for k in keys:
                 weight_map[k] = fname
@@ -482,15 +514,6 @@ def _write_even_shards(
     for m, b in gathered:
         full_map.update(m)
         total_bytes += b
-    # The reverse conversion checks for rename collisions, but only within one rank's slice.
-    # A collision ACROSS ranks would otherwise be silently swallowed by this dict update and
-    # ship a checkpoint that is quietly missing a tensor. Every rank checks, so all of them raise.
-    n_written = sum(len(m) for m, _ in gathered)
-    if n_written != len(full_map):
-        raise RuntimeError(
-            f"tensor name collision across ranks: {n_written} tensors written but only "
-            f"{len(full_map)} distinct names in the index"
-        )
 
     def write_index() -> bool:
         if rank == 0:
