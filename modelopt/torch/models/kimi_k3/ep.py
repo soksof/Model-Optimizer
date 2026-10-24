@@ -326,10 +326,22 @@ def _patch_kda_beta_sigmoid(kmod) -> None:
 
     if getattr(kmod, "_kimi_k3_beta_sigmoid_patched", False):
         return
-    patched_any = False
-    for fname in ("chunk_kda", "fused_recurrent_kda"):
-        orig = getattr(kmod, fname, None)
-        if orig is None or getattr(orig, "_kimi_k3_beta_wrapped", False):
+    kernels = [
+        f for f in ("chunk_kda", "fused_recurrent_kda") if getattr(kmod, f, None) is not None
+    ]
+    if not kernels:
+        if getattr(kmod, "KimiDeltaAttention", None) is None:
+            return  # no KDA layers to patch
+        # Unpatched, the divergence would surface only as a NaN amax after the whole calibration.
+        raise RuntimeError(
+            "kimi_k3: the remote module defining KimiDeltaAttention has no chunk_kda or "
+            "fused_recurrent_kda to apply sigmoid(beta) around, so its KDA recurrence would "
+            "diverge to inf on trained weights; the checkpoint's remote code is not the one this "
+            "adapter patches."
+        )
+    for fname in kernels:
+        orig = getattr(kmod, fname)
+        if getattr(orig, "_kimi_k3_beta_wrapped", False):
             continue
 
         def _make(orig_fn):
@@ -360,14 +372,12 @@ def _patch_kda_beta_sigmoid(kmod) -> None:
             return _wrapped
 
         setattr(kmod, fname, _make(orig))
-        patched_any = True
     kmod._kimi_k3_beta_sigmoid_patched = True
-    if patched_any:
-        print(
-            "[kimi_k3] patched chunk_kda/fused_recurrent_kda: apply sigmoid(beta) in torch "
-            "(fla-core use_beta_sigmoid_in_kernel is a no-op -> KDA state explodes on real weights)",
-            flush=True,
-        )
+    print(
+        "[kimi_k3] patched chunk_kda/fused_recurrent_kda: apply sigmoid(beta) in torch "
+        "(fla-core use_beta_sigmoid_in_kernel is a no-op -> KDA state explodes on real weights)",
+        flush=True,
+    )
 
 
 def _shim_create_causal_mask(kmod) -> None:
@@ -377,8 +387,8 @@ def _shim_create_causal_mask(kmod) -> None:
     attention_mask=, cache_position=, past_key_values=, position_ids=)``, but tf 5.13's ``create_causal_mask`` renamed
     ``input_embeds`` -> ``inputs_embeds`` and no longer accepts ``cache_position`` -> ``TypeError`` at the first
     calibration forward. The remote module binds ``create_causal_mask`` at import (``from transformers.masking_utils
-    import ...``), so wrap that module-level reference: translate ``input_embeds`` -> ``inputs_embeds`` and drop any
-    kwargs the installed signature does not accept (robust to further drift). Idempotent.
+    import ...``), so wrap that module-level reference: translate ``input_embeds`` -> ``inputs_embeds`` and drop
+    ``cache_position`` where the installed signature does not take it. Idempotent.
     """
     import functools
     import inspect
@@ -401,14 +411,16 @@ def _shim_create_causal_mask(kmod) -> None:
     def _wrapped(*args, **kwargs):
         if "input_embeds" in kwargs and "inputs_embeds" not in kwargs:
             kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
-        if accepted is not None:
-            kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        if accepted is not None and "cache_position" not in accepted:
+            # Only this one: any other keyword the installed signature rejects shapes the mask, so
+            # dropping it would build a wrong mask silently instead of raising.
+            kwargs.pop("cache_position", None)
         return orig(*args, **kwargs)
 
     setattr(_wrapped, "_kimi_k3_ccm_shim", True)
     kmod.create_causal_mask = _wrapped
     print(
-        "[kimi_k3] shimmed create_causal_mask (input_embeds->inputs_embeds; drop unaccepted kwargs; tf>=5.13)",
+        "[kimi_k3] shimmed create_causal_mask (input_embeds->inputs_embeds; drop cache_position; tf>=5.13)",
         flush=True,
     )
 
@@ -558,7 +570,7 @@ def prepare(
 
     Steps: shim OutputRecorder -> force-load + monkey-patch the remote KimiSparseMoeBlock (fused experts +
     ExpertsInterface forward) -> set base_model_ep_plan on text_config -> register the w1/w3/w2 fusion
-    converters and the decompressor. Returns the (unchanged) config.
+    converters and the decompressor. Returns the same config object, mutated in place.
 
     The 896 ``mxfp4-pack-quantized`` routed experts are DECOMPRESSED at load: ``_onfly_decompress``
     dequantizes each local expert's packed weight -> bf16 INSIDE the fused-expert conversion, stored as

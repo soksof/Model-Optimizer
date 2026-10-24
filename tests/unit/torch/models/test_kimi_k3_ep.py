@@ -391,13 +391,26 @@ def test_kda_beta_is_squashed_in_torch_only_when_the_kernel_flag_asks_for_it(by)
     assert [(seen is beta, flag) for _, seen, flag in remote.calls] == [(True, False)] * 2
 
 
+def test_kda_layers_whose_kernels_the_beta_patch_cannot_find_are_refused():
+    """Left unwrapped, the raw gate would show up only as a NaN amax after a whole calibration, so
+    KDA layers without the kernels to wrap stop the load; a model without KDA layers loads."""
+    remote = _remote_module()
+    del remote.chunk_kda, remote.fused_recurrent_kda
+
+    with pytest.raises(RuntimeError, match="KimiDeltaAttention"):
+        kimi_k3._patch_kda_beta_sigmoid(remote)
+
+    del remote.KimiDeltaAttention
+    kimi_k3._patch_kda_beta_sigmoid(remote)
+
+
 # ------------------------------------------------------------- transformers-version compatibility
 
 
 def test_create_causal_mask_shim_adapts_the_remote_call_once():
     """The remote code calls ``create_causal_mask(input_embeds=..., cache_position=...)``; current
     transformers takes ``inputs_embeds`` and no ``cache_position``. The shim renames the one, drops
-    what the installed signature does not accept, and wraps only once."""
+    the other, and wraps only once."""
     remote = _remote_module()
     kimi_k3._shim_create_causal_mask(remote)
     shim = remote.create_causal_mask
@@ -426,6 +439,19 @@ def test_create_causal_mask_shim_keeps_what_a_kwargs_signature_takes():
     kept = remote.create_causal_mask(config="config", input_embeds="embeds", cache_position=0)
 
     assert kept == {"cache_position": 0}
+
+
+def test_create_causal_mask_shim_lets_a_rejected_mask_input_raise():
+    """Only ``cache_position`` is dropped. A release that renamed ``attention_mask`` would otherwise
+    get a mask built without the padding, silently, instead of the remote call's ``TypeError``."""
+    remote = types.ModuleType("kimi_k3_renamed_stub")
+    remote.create_causal_mask = lambda config, inputs_embeds, padding_mask=None: padding_mask
+    kimi_k3._shim_create_causal_mask(remote)
+
+    with pytest.raises(TypeError):
+        remote.create_causal_mask(
+            config="config", input_embeds="embeds", attention_mask="mask_2d", cache_position=0
+        )
 
 
 def test_kimi_cache_mask_sizes_accept_a_query_length_or_a_cache_position():

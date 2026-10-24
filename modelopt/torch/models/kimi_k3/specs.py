@@ -28,9 +28,11 @@ register(
     ModelSpec(
         model_type="kimi_k3",
         modeling_source="remote_code",
-        # The release prepare's patches to the checkpoint's code were validated against.
         ep_spec=EPSpec(
-            prepare=prepare, prepared_ep_plan=BASE_MODEL_EP_PLAN, requires_transformers="5.13"
+            prepare=prepare,
+            prepared_ep_plan=BASE_MODEL_EP_PLAN,
+            # prepare's patches to the checkpoint's remote code were validated on this release.
+            requires_transformers="5.13",
         ),
     )
 )
