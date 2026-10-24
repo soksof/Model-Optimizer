@@ -91,8 +91,8 @@ def _read_compression(hf_config):
 
     ``compressor`` is the registered compressor for ``format`` (its ``decompress`` classmethod is the
     dequant); ``scheme`` is the ``QuantizationScheme`` (supplies ``scheme.weights`` to ``decompress``);
-    ``param_names`` is the exact set of stored sibling keys per weight. The experts' group is chosen as
-    the sole config group, else the one whose ``targets`` reference "expert", else the first.
+    ``param_names`` is the exact set of stored sibling keys per weight. The checkpoint's one config
+    group is the experts' scheme; a checkpoint with several is refused.
     ``None`` for a config with no ``quantization_config``: nothing to decompress."""
     # Look the config up first: with none, compressed_tensors need not even be installed. A config
     # that fails to parse raises pydantic's ValidationError, a ValueError of its own.
@@ -104,17 +104,15 @@ def _read_compression(hf_config):
 
     qconfig = QuantizationConfig.model_validate(quantization_config)
     groups = qconfig.config_groups
-    if len(groups) == 1:
-        scheme = next(iter(groups.values()))
-    else:
-        scheme = next(
-            (
-                g
-                for g in groups.values()
-                if any("expert" in str(t).lower() for t in (getattr(g, "targets", None) or []))
-            ),
-            next(iter(groups.values())),
+    if len(groups) != 1:
+        # Only the expert converters are rewritten, so another group's weights would load newly
+        # initialized, and which group holds the experts would be a guess.
+        raise NotImplementedError(
+            f"install_onfly_decompress: the checkpoint has {len(groups)} compressed-tensors config "
+            f"groups ({', '.join(groups) or 'none'}); on-the-fly decompression handles a single "
+            "group, compressing only the experts. Decompress the checkpoint first."
         )
+    [scheme] = groups.values()
     fmt = qconfig.format
     fmt = fmt.value if hasattr(fmt, "value") else str(fmt)
     compressor = BaseCompressor.get_value_from_registry(fmt)
@@ -184,7 +182,12 @@ def _make_op_class(compressor, scheme, param_names):
                     for i in range(len(anchor_list))
                     if anchor_list[i] is not None
                 ]
-            out.update(input_dict)  # nothing else expected, but pass through defensively
+            if input_dict:
+                # A stored param without its weight, or a source that is no weight: passed on, the
+                # merge would fuse it into the wrong slot or fail far from here.
+                raise ValueError(
+                    f"DecompressExperts: unconsumed checkpoint keys {sorted(input_dict)}"
+                )
             return out
 
     return DecompressExperts
@@ -207,7 +210,7 @@ def _compressedify(conv, compressor, scheme, param_names):
             for pn in param_names:
                 by_pname[pn].append(stem + "." + pn + "$")
         else:
-            by_pname[param_names[0]].append(p)  # leave non-weight sources as-is (none expected)
+            by_pname[param_names[0]].append(p)  # DecompressExperts refuses it (none expected)
     new_sources = [s for pn in param_names for s in by_pname[pn]]
     tgt = getattr(conv, "_original_target_patterns", conv.target_patterns)
     new = WeightConverter(
@@ -252,10 +255,7 @@ _MARK = "_modelopt_onfly_decompress"
 
 def _mark(hf_config, fmt):
     """Mark ``hf_config``'s load for the installed hooks; ``from_pretrained``'s copy of it keeps the mark."""
-    if isinstance(hf_config, dict):
-        hf_config[_MARK] = fmt
-    else:
-        setattr(hf_config, _MARK, fmt)
+    setattr(hf_config, _MARK, fmt)
 
 
 def is_marked(hf_config) -> bool:
@@ -275,14 +275,16 @@ def install_onfly_decompress(hf_config):
     for it marks that config too, and installing for a checkpoint compressed differently raises. Only a
     model built from a marked config has its converters rewritten; any other model ``from_pretrained``
     loads in the process, an uncompressed MoE say, keeps its stock converters."""
-    import transformers.modeling_utils as mu
-    from transformers.core_model_loading import WeightConverter
-
     from modelopt.torch.utils import print_rank_0
     from modelopt.torch.utils.moe import require_transformers
 
-    installed = getattr(mu.get_model_conversion_mapping, "_onfly_compression", None)
     compression = _read_compression(hf_config)
+    require_transformers("5.8", "on-the-fly compressed-tensors decompression")
+    # Imported once the release is known to have them: transformers 4 has no core_model_loading.
+    import transformers.modeling_utils as mu
+    from transformers.core_model_loading import WeightConverter
+
+    installed = getattr(mu.get_model_conversion_mapping, "_onfly_compression", None)
     if installed is not None:
         if compression is None:
             # The prepare that installed the hooks drops quantization_config from its config, already
@@ -303,7 +305,6 @@ def install_onfly_decompress(hf_config):
             "install_onfly_decompress: config has no compressed-tensors quantization_config"
         )
     compressor, scheme, param_names, fmt = compression
-    require_transformers("5.8", "on-the-fly compressed-tensors decompression")
     _install_keep_int_native()
     orig = mu.get_model_conversion_mapping
 

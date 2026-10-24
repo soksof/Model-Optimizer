@@ -100,19 +100,21 @@ def _load(converters, checkpoint):
 # ------------------------------------------------------------- rewriting the per-expert converters
 
 
-def test_non_weight_sources_are_kept_verbatim():
-    """Only ``.weight`` sources name a compressed tensor; any other source passes through as is."""
+def test_a_source_the_decompression_does_not_consume_fails_the_load():
+    """Only ``.weight`` sources name a compressed tensor. Another source still reaches the
+    decompress op, which refuses it rather than hand the merge a tensor it would fuse into the wrong
+    slot."""
     conv = WeightConverter(
         source_patterns=["mlp.experts.*.gate_proj.weight", "mlp.experts.*.gate_proj.bias"],
         target_patterns="mlp.experts.gate_proj",
         operations=[MergeModulelist(dim=0)],
     )
-    rewritten = onfly._compressedify(conv, _ScaledCompressor, None, PACKED)
+    key = "model.layers.0.mlp.experts.0.gate_proj."
+    checkpoint = {key + name: torch.ones(2, 2, dtype=torch.int32) for name in PACKED}
+    checkpoint[key + "bias"] = torch.ones(2)
 
-    assert "mlp.experts.*.gate_proj.bias" in rewritten.source_patterns
-    assert sorted(p for p in rewritten.source_patterns if "weight" in p) == sorted(
-        f"mlp.experts.*.gate_proj.{name}$" for name in PACKED
-    )
+    with pytest.raises(ValueError, match=r"unconsumed checkpoint keys .*gate_proj\.bias"):
+        _load([onfly._compressedify(conv, _ScaledCompressor, None, PACKED)], checkpoint)
 
 
 def test_a_rewritten_converter_keeps_the_scope_transformers_set_on_it():
@@ -505,28 +507,23 @@ EXPERTS = ["re:.*experts.*"]
 
 
 @pytest.mark.parametrize(
-    ("groups", "zero_point"),
+    "groups",
     [
-        ({"attn": _int4(True, ATTN), "moe": _int4(False, EXPERTS)}, True),
-        ({"moe": _int4(True, EXPERTS), "attn": _int4(False, ATTN)}, False),
-        ({"attn": _int4(False, ATTN), "dense": _int4(True, ["Linear"])}, True),
+        {"attn": _int4(True, ATTN), "moe": _int4(False, EXPERTS)},
+        {"attn": _int4(False, ATTN), "dense": _int4(True, ["Linear"])},
     ],
-    ids=["expert-group-second", "expert-group-first", "no-expert-group-takes-the-first"],
+    ids=["an-expert-group-among-others", "no-expert-group"],
 )
-def test_the_expert_config_group_decides_the_stored_params(groups, zero_point):
-    """With several config groups the one targeting experts wins, else the first; an asymmetric
-    scheme stores a zero-point next to the packed weight, a symmetric one does not."""
+def test_a_checkpoint_compressed_in_several_config_groups_is_refused(groups):
+    """Only the expert converters are rewritten: another group's weights would load newly
+    initialized, and a group guessed for the experts would decompress them with the wrong scheme."""
     pytest.importorskip(
         "compressed_tensors", reason="needs compressed-tensors (CI's unit session installs it)"
     )
     config = SimpleNamespace(quantization_config=_pack_quantized(**groups))
 
-    _, scheme, names, fmt = onfly._read_compression(config)
-
-    assert fmt == "pack-quantized"
-    assert names[: len(PACKED)] == PACKED
-    assert ("weight_zero_point" in names) is zero_point
-    assert scheme.weights.symmetric is not zero_point
+    with pytest.raises(NotImplementedError, match="2 compressed-tensors config groups"):
+        onfly._read_compression(config)
 
 
 def test_real_pack_quantized_experts_round_trip_exactly():
