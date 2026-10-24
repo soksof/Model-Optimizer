@@ -236,6 +236,33 @@ def test_a_tensorrt_llm_checkpoint_export_needs_a_single_process(
             hf_ptq._resolve_distribution(args)
 
 
+@pytest.mark.parametrize(
+    ("world_size", "env", "use_fsdp2"),
+    [(2, {"MODELOPT_EP_DEGREE": "2"}, False), (2, {}, False), (2, {}, True), (1, {}, False)],
+    ids=["expert_parallel", "replicated", "use_fsdp2", "single_process"],
+)
+def test_an_auto_quantize_recipe_is_refused_on_the_routes_this_script_adds(
+    hf_ptq, monkeypatch, torchrun, world_size, env, use_fsdp2
+):
+    """AutoQuantize scores each rank's own calibration shard and reduces no score across ranks, so
+    the ranks could choose different formats per layer. An expert-parallel or replicated run refuses
+    the recipe before the load; --use_fsdp2 keeps main's warning, and a single process runs it."""
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    _serve(monkeypatch, hf_ptq, _deepseek_v3(n_routed_experts=8))
+    args = _args(
+        torchrun(world_size=world_size),
+        use_fsdp2=use_fsdp2,
+        recipe="general/auto_quantize/nvfp4_fp8_kl_div_at_5p4bits",
+    )
+
+    if world_size == 1 or use_fsdp2:
+        hf_ptq._resolve_distribution(args)
+    else:
+        with pytest.raises(NotImplementedError, match="AutoQuantize"):
+            hf_ptq._resolve_distribution(args)
+
+
 # ---------------------------------------------------------------------------------- load_model
 
 

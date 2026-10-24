@@ -359,6 +359,15 @@ def _resolve_distribution(args: argparse.Namespace):
             "--sparsity_fmt, int8_smoothquant) runs in a single process; launch hf_ptq without "
             "torchrun for it."
         )
+    if plan.world_size > 1 and not args.use_fsdp2 and _recipe_is_auto_quantize(args.recipe):
+        # Its search scores each rank's own calibration shard and reduces no score across ranks, so
+        # the ranks can choose different formats per layer: under expert parallelism, a checkpoint
+        # of mixed formats. --use_fsdp2 keeps main's warning for it.
+        raise NotImplementedError(
+            f"{plan!r}: AutoQuantize scores each rank's own calibration data and reduces no score "
+            "across ranks, so ranks could choose different formats per layer; launch hf_ptq "
+            "without torchrun for an AutoQuantize recipe."
+        )
     return plan, hf_config
 
 
