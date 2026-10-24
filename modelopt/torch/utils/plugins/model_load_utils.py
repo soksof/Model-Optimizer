@@ -1332,7 +1332,8 @@ def _decide_distribution(
             f"({num_experts})."
         )
     # Why the expert-parallel load cannot shard the dense part, if it cannot: the export cannot write
-    # it sharded within several expert-data-parallel replicas.
+    # it sharded within several expert-data-parallel replicas, and Distributed Checkpoint, which
+    # loads it sharded, cannot dequantize a block-fp8 checkpoint's F8_E8M0 scales.
     unshardable, remedy = None, ""
     if ep_size > 1 and world_size // ep_size > 1:
         unshardable = (
@@ -1342,6 +1343,12 @@ def _decide_distribution(
         remedy = (
             " Set MODELOPT_EP_DEGREE to the world size if it divides the expert count, or "
             "MODELOPT_FSDP_SIZE=1 if the dense part fits one GPU."
+        )
+    elif ep_size > 1 and _ckpt_quant_method(hf_config) == "fp8":
+        unshardable = "from a block-fp8 checkpoint: Distributed Checkpoint cannot dequantize its F8_E8M0 scales"
+        remedy = (
+            " Set MODELOPT_FSDP_SIZE=1 to replicate it, which dequantizes it as it loads, or start "
+            "from an unquantized copy of the model."
         )
     if dense == "auto":
         # A rank holds a whole copy of what expert parallelism does not shard, and its 1/ep_size
@@ -1781,12 +1788,13 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
 
         block_m = _blk(rows, scale_rows, wbs[0])
         block_n = _blk(cols, scale_cols, wbs[1])
-        # In place on q, its own copy: the product would be a third full-size fp32 temporary.
-        q *= (
-            scales.to(torch.float32)
-            .repeat_interleave(block_m, dim=-2)
-            .repeat_interleave(block_n, dim=-1)[..., :rows, :cols]
-        )
+        # Scale q, its own copy, in place: its whole column blocks through a view, then a partial
+        # last one. The scales are tiled over the rows only, so no full-size fp32 tile is built.
+        s = scales.to(torch.float32).repeat_interleave(block_m, dim=-2)[..., :rows, :]
+        whole = cols // block_n
+        q[..., : whole * block_n].unflatten(-1, (whole, block_n)).mul_(s[..., :whole, None])
+        if whole < scale_cols:
+            q[..., whole * block_n :].mul_(s[..., whole:])
         return q.to(out_dtype)
 
     # --- Fix the routed-expert block-FP8 load corruption (transformers 5.9) ---------------------
@@ -1852,7 +1860,6 @@ def _patch_finegrained_fp8_dequant(target_dtype=None):
                         and len(ops) >= 2
                         and isinstance(ops[0], _fp8.Fp8Dequantize)
                         and isinstance(ops[1], _MergeModulelist)
-                        and not isinstance(ops[1], _DequantThenMerge)
                     ):
                         deq, mml = ops[0], ops[1]
                         ops[:2] = [_DequantThenMerge(deq, dim=mml.dim)]
@@ -2143,7 +2150,8 @@ def load_and_prepare_ep(
 
     With ``plan.dense == "fsdp"`` the dense part is instead FSDP2-sharded over the ``ep`` group and each
     rank loads only its shard from the checkpoint, never the whole of it -- for a model whose dense part
-    does not fit one GPU.
+    does not fit one GPU. A block-fp8 checkpoint cannot be loaded that way: Distributed Checkpoint
+    cannot dequantize its F8_E8M0 scales.
 
     EP CANNOT be applied to a meta-init model (transformers' ``GroupedGemmParallel.shard_tensor``
     slices materialized tensors), so this loads real weights via ``from_pretrained`` over the ``ep``
@@ -2206,6 +2214,11 @@ def load_and_prepare_ep(
             config_kwargs["attn_implementation"] = attn_implementation
         hf_config = AutoConfig.from_pretrained(ckpt_path, **config_kwargs)
     quant_method = _ckpt_quant_method(hf_config)
+    if plan.is_fsdp_dense and quant_method == "fp8":
+        raise NotImplementedError(
+            f"{plan!r}: the dense part of a block-fp8 checkpoint cannot be sharded, since Distributed "
+            "Checkpoint cannot dequantize its F8_E8M0 scales. Plan dense='replicate'."
+        )
     if quant_method not in _EP_SOURCE_FORMATS:
         # transformers' own quantizer would load it as stored, for PTQ to treat as plain weights.
         dequantized = ", ".join(sorted(f for f in _EP_SOURCE_FORMATS if f))
@@ -2289,7 +2302,7 @@ def load_and_prepare_ep(
     if attn_implementation is not None:
         from_pretrained_kwargs["attn_implementation"] = attn_implementation
     # Native block-FP8 checkpoints (e.g. DeepSeek-V3: quantization_config.quant_method="fp8", e4m3 with
-    # weight_block_size) must be DEQUANTIZED to bf16 on load: ModelOpt PTQ inserts/exports quantizers on
+    # weight_block_size) must be DEQUANTIZED to the model dtype on load: ModelOpt PTQ inserts/exports quantizers on
     # plain bf16 Linears, and the EP grouped_gemm experts expect bf16 fused params -- not fp8 blocks with
     # weight_scale_inv. Mirror get_model's mxfp4 dequant-on-load, using FineGrainedFP8Config(dequantize=True).
     # (compressed-tensors pack-quantized experts, e.g. Kimi, are handled separately by the on-the-fly
@@ -2303,7 +2316,7 @@ def load_and_prepare_ep(
         )  # correct transformers' block-fp8 dequant; emit model dtype
         if is_master():
             print(
-                "[ep] native block-fp8 checkpoint -> FineGrainedFP8Config(dequantize=True) -> bf16",
+                f"[ep] native block-fp8 checkpoint -> FineGrainedFP8Config(dequantize=True) -> {dtype}",
                 flush=True,
             )
     elif quant_method == "mxfp4":

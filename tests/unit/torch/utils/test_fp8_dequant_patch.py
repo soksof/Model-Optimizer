@@ -107,6 +107,7 @@ def _reference(weight, scale_inv, block):
     [
         ((8, 12), (4, 4), (4, 4), None),
         ((10, 13), (4, 4), (4, 4), None),
+        ((8, 3), (4, 4), (4, 4), None),
         ((9, 8), (4, 4), (4, 4), None),
         ((6, 10), (2, 4), (2, 4), None),
         ((3, 10, 13), (4, 4), (4, 4), None),
@@ -118,6 +119,7 @@ def _reference(weight, scale_inv, block):
     ids=[
         "whole-blocks",
         "partial-last-blocks",
+        "narrower-than-a-block",
         "grid-divides-the-rows",
         "non-square-blocks",
         "per-expert",

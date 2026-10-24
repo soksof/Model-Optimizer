@@ -107,15 +107,15 @@ def test_expert_param_matcher(plan, name, expected):
 # ------------------------------------------------------------------ a block-fp8 checkpoint
 
 
-def test_a_block_fp8_checkpoint_is_refused_as_a_format_whatever_its_dense_layout(monkeypatch):
-    """This load does not dequantize block-fp8 checkpoints at all, so that is the refusal a plan
-    sharding their dense part meets, not one advising to replicate it."""
+def test_a_block_fp8_checkpoints_dense_part_is_not_sharded(monkeypatch):
+    """DCP cannot dequantize block-fp8 dense weights, so a plan sharding them is refused before the
+    load starts, where from_pretrained would dequantize them as it replicated them."""
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
     config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
 
-    with pytest.raises(NotImplementedError, match="cannot dequantize a 'fp8' checkpoint"):
+    with pytest.raises(NotImplementedError, match="block-fp8 checkpoint cannot be sharded"):
         load_and_prepare_ep("unused", DistributionPlan(2, 2, "fsdp"), hf_config=config)
 
 
