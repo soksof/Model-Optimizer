@@ -1336,11 +1336,15 @@ def _decide_distribution(
     # Why the expert-parallel load cannot shard the dense part, if it cannot: the export cannot write
     # it sharded within several expert-data-parallel replicas, and Distributed Checkpoint, which
     # loads it sharded, cannot dequantize a block-fp8 checkpoint's F8_E8M0 scales.
-    unshardable = None
+    unshardable, remedy = None, ""
     if ep_size > 1 and world_size // ep_size > 1:
         unshardable = (
             f"within each of its {world_size // ep_size} expert-data-parallel replicas, a layout "
             "the export cannot write yet"
+        )
+        remedy = (
+            " Set MODELOPT_EP_DEGREE to the world size if it divides the expert count, or "
+            "MODELOPT_FSDP_SIZE=1 if the dense part fits one GPU."
         )
     elif ep_size > 1 and _ckpt_quant_method(hf_config) == "fp8":
         unshardable = "from a block-fp8 checkpoint: Distributed Checkpoint cannot dequantize its F8_E8M0 scales"
@@ -1366,7 +1370,7 @@ def _decide_distribution(
         dense = "fsdp" if too_big and not unshardable else "replicate"
     elif dense == "fsdp" and unshardable:
         raise NotImplementedError(
-            f"The dense part of {hf_config.model_type} cannot be sharded {unshardable}."
+            f"The dense part of {hf_config.model_type} cannot be sharded {unshardable}.{remedy}"
         )
     return DistributionPlan(world_size, ep_size, dense)
 
