@@ -1394,8 +1394,10 @@ def _decide_distribution(
         raise RuntimeError(
             f"{hf_config.model_type} can be expert-parallel, but the plan resolved to ep_size=1 at "
             f"world_size={world_size}, so every rank would hold the whole MoE. Shard its experts "
-            "(MODELOPT_EP_DEGREE above 1, dividing both the expert count and the world size), or "
-            "shard the whole model with FSDP2."
+            f"(MODELOPT_EP_DEGREE above 1, dividing both its {num_experts} experts and the world "
+            "size), shard the whole model with FSDP2 (MODELOPT_FSDP_SIZE=world, for an unquantized "
+            "checkpoint), load it in a single process, or replicate it on every rank outright with "
+            f"load_pretrained(..., distribution=DistributionPlan({world_size}, 1, 'replicate'))."
         )
     return DistributionPlan(world_size, ep_size, dense)
 
