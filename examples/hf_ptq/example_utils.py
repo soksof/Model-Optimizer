@@ -601,19 +601,20 @@ def get_model(
             UserWarning,
         )
 
-    device_map = "auto"
-    if device == "cpu":
-        device_map = "cpu"
-    elif ":" in str(device) and plan.world_size > 1:
-        # Under torchrun each rank asks for its own "cuda:<local_rank>". Do not fall through to
-        # "auto": accelerate runs its placement heuristic INDEPENDENTLY in every rank, and on a node
-        # whose GPUs are all idle every rank scores them identically and picks the SAME card. All ranks'
-        # weights, and with them every quantizer's _amax buffer, then live on one GPU; the first NCCL
-        # collective binds the whole data-parallel group to that single device and aborts with
-        # "Duplicate GPU detected : rank 1 and rank 0 both on CUDA device ...". Honour the caller.
-        # A dense model too large to replicate per rank wants --use_fsdp2, not "auto" sharding: under
-        # data-parallel calibration each rank must own its own GPU. A single process keeps "auto".
-        device_map = {"": str(device)}
+    # Under torchrun each rank asks for its own "cuda:<local_rank>". Do not fall through to "auto":
+    # accelerate runs its placement heuristic INDEPENDENTLY in every rank, and on a node whose GPUs
+    # are all idle every rank scores them identically and picks the SAME card. All ranks' weights,
+    # and with them every quantizer's _amax buffer, then live on one GPU; the first NCCL collective
+    # binds the whole data-parallel group to that single device and aborts with "Duplicate GPU
+    # detected : rank 1 and rank 0 both on CUDA device ...". Every load path below honours the pin.
+    # A dense model too large to replicate per rank wants --use_fsdp2, not "auto" sharding: under
+    # data-parallel calibration each rank must own its own GPU. A single process keeps "auto".
+    pinned = (
+        {"": str(device)}
+        if device != "cpu" and ":" in str(device) and plan.world_size > 1
+        else None
+    )
+    device_map = "cpu" if device == "cpu" else pinned or "auto"
 
     # Prepare config kwargs for loading
     config_kwargs = {"trust_remote_code": trust_remote_code} if trust_remote_code else {}
@@ -644,13 +645,24 @@ def get_model(
     # modules together for checkpoints that fit; larger ones can still spill and split a
     # tied pair, and need an explicit single-device map. Multi-GPU only: a single-GPU split
     # cannot separate a tied pair, and sequential would needlessly cap max_memory there.
-    if device != "cpu" and torch.cuda.device_count() > 1 and is_diffusion_gemma(hf_config):
+    if (
+        not pinned
+        and device != "cpu"
+        and torch.cuda.device_count() > 1
+        and is_diffusion_gemma(hf_config)
+    ):
         print(
             "Detected DiffusionGemma model. Using device_map='sequential'; the balanced "
             "'auto' mapping can split its tied encoder/decoder weights across GPUs."
         )
         use_seq_device_map = True
 
+    if use_seq_device_map and pinned:
+        raise ValueError(
+            f"--use_seq_device_map spreads one model over every GPU, but each rank of this run "
+            f"holds its own copy on its own GPU ({device}). Drop it, or shard the model with "
+            "--use_fsdp2."
+        )
     if use_seq_device_map:
         device_map = "sequential"
         # If we use sequential, set max_memory limit to ensure that the model does not occupy the full GPU
@@ -715,7 +727,7 @@ def get_model(
                 AutoModelForCausalLM,
                 model_type=hf_config.model_type,
                 distribution=plan,
-                device_map="auto",
+                device_map=pinned or "auto",
                 trust_remote_code=trust_remote_code,
                 dtype="auto",
             )
@@ -742,7 +754,7 @@ def get_model(
             AutoModelForCausalLM,
             model_type=hf_config.model_type,
             distribution=plan,
-            device_map="cpu" if device == "cpu" else "sequential",
+            device_map="cpu" if device == "cpu" else pinned or "sequential",
             **model_kwargs,
         )
     else:

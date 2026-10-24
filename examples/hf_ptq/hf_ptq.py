@@ -193,6 +193,20 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return {k: _to_device(v) for k, v in batch.items()}
 
 
+def _shard_calib_dataloader(calib_dataloader, rank: int, world_size: int):
+    """This rank's share of the calibration data, in the loader type it came in."""
+    if isinstance(calib_dataloader, _DeviceDataLoader):
+        return _DeviceDataLoader(
+            shard_dataloader(calib_dataloader.dataloader, rank, world_size), calib_dataloader.device
+        )
+    if isinstance(calib_dataloader, DataLoader):
+        return shard_dataloader(calib_dataloader, rank, world_size)
+    raise NotImplementedError(
+        f"A {type(calib_dataloader).__name__} calibration loader cannot be split across this "
+        f"run's {world_size} ranks."
+    )
+
+
 def make_calib_dataloader(
     args: argparse.Namespace,
     language_model: torch.nn.Module,
@@ -276,12 +290,14 @@ def make_calib_dataloader(
             include_labels=include_labels,
         )
     world_size = distribution_plan(language_model).world_size
-    if world_size > 1 and calib_dataloader is not None and isinstance(calib_dataloader, DataLoader):
+    if world_size > 1 and calib_dataloader is not None:
         # Every distributed calibration path is data-parallel over the world, so each rank calibrates
         # on its own per-rank shard (and the quantizer amax is synced across ranks): MoE expert-parallel
         # a2a routes each token to its expert-owning rank; dense DP replicates the model per rank; FSDP2
         # shards the params but still feeds each rank its own data.
-        calib_dataloader = shard_dataloader(calib_dataloader, args.dist_state.rank, world_size)
+        calib_dataloader = _shard_calib_dataloader(
+            calib_dataloader, args.dist_state.rank, world_size
+        )
     return calib_dataloader, first_text_speech_dataset
 
 
@@ -948,15 +964,20 @@ def post_quantize(
         # part of the model to CPU (seen on unified-memory single-GPU hosts) can make a
         # quantized layer run on CPU, which some kernels (e.g. NVFP4 dynamic block
         # quantization) don't support. Don't let that discard the completed calibration.
+        lockstep = preview_generate_kwargs(full_model)
         try:
             with keep_the_experts_implementation(full_model):
                 generated_ids_after_ptq = full_model.generate(
                     preview_input_ids,
                     attention_mask=preview_attention_mask,
                     max_new_tokens=100,
-                    **preview_generate_kwargs(full_model),
+                    **lockstep,
                 )
         except Exception as e:
+            if lockstep:
+                # A sharded model's ranks decode in lockstep: a rank that skipped the preview would
+                # leave the others blocked in the next step's collective. Raising aborts the run.
+                raise
             warnings.warn(f"Post-quantization generation sanity check failed, skipping it: {e}")
     elif is_nemotron_vl_model and tokenizer is not None:
         generated_ids_after_ptq = run_nemotron_vl_preview(

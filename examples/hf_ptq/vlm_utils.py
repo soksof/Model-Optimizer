@@ -193,6 +193,8 @@ def run_vl_preview_generation(
         return response
 
     except Exception as e:
+        if (generation_kwargs or {}).get("synced_gpus"):
+            raise  # the other ranks of a sharded model would wait for this one in lockstep
         print(f"❌ VL preview generation {stage_name} failed: {e}")
         print("This may indicate issues with the quantized model")
         return None
@@ -270,5 +272,7 @@ def run_text_only_generation(
             return output_text[0]
 
     except Exception as e:
+        if generation_config.get("synced_gpus"):
+            raise  # the other ranks of a sharded model would wait for this one in lockstep
         print(f"Text-only generation failed: {e}")
         return None

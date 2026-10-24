@@ -324,9 +324,14 @@ def test_load_model_hands_load_pretrained_the_plan_and_the_config_it_was_decided
     (call,) = calls
     assert call["ckpt_path"] == _CKPT
     assert call["distribution"] == plan
-    assert call["kwargs"] == {"hf_config": served, **passed}
+    hf_config = call["kwargs"].pop("hf_config")
+    assert call["kwargs"] == passed
     if plan.is_expert_parallel:
-        assert served.base_model_ep_plan == get_spec("deepseek_v3").ep_spec.base_model_ep_plan
+        # The spec's plan goes on the decision's own copy of the config.
+        assert hf_config.base_model_ep_plan == get_spec("deepseek_v3").ep_spec.base_model_ep_plan
+        assert served.base_model_ep_plan is None
+    else:
+        assert hf_config is served
 
 
 def test_a_whole_model_loads_by_the_plan_through_get_model(hf_ptq, monkeypatch, torchrun):
@@ -390,6 +395,50 @@ def test_a_rank_device_pins_the_whole_model_to_it(
     example_utils.get_model(str(tmp_path), device=device, distribution=plan)
 
     assert placed == [device_map]
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["pack-quantized", "mxfp4", "diffusion-gemma"],
+)
+def test_every_load_path_keeps_the_rank_pin(monkeypatch, tmp_path, checkpoint):
+    """A pack-quantized or MXFP4 checkpoint loads through a path of its own, and DiffusionGemma asks
+    for a sequential map on a multi-GPU node; each would otherwise place every rank's copy over the
+    same GPUs."""
+    quantization_config = {
+        "pack-quantized": {"quant_method": "compressed-tensors", "format": "pack-quantized"},
+        "mxfp4": {"quant_method": "mxfp4"},
+    }.get(checkpoint)
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"], quantization_config=quantization_config, **_TINY
+    ).save_pretrained(tmp_path)
+    if checkpoint == "diffusion-gemma":
+        monkeypatch.setattr(example_utils, "is_diffusion_gemma", lambda config: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(example_utils, "_unpack_compressed_linear_weights", lambda *args: None)
+    placed = []
+
+    def load_pretrained(ckpt_path, auto_class, **kwargs):
+        placed.append(kwargs["device_map"])
+        return torch.nn.Linear(1, 1)
+
+    monkeypatch.setattr(example_utils, "load_pretrained", load_pretrained)
+
+    example_utils.get_model(str(tmp_path), device="cuda:1", distribution=DistributionPlan(4))
+
+    assert placed == [{"": "cuda:1"}]
+
+
+def test_a_sequential_map_is_refused_where_each_rank_holds_its_own_copy(tmp_path):
+    LlamaConfig(architectures=["LlamaForCausalLM"], **_TINY).save_pretrained(tmp_path)
+
+    with pytest.raises(ValueError, match="--use_seq_device_map"):
+        example_utils.get_model(
+            str(tmp_path),
+            device="cuda:1",
+            distribution=DistributionPlan(4),
+            use_seq_device_map=True,
+        )
 
 
 # ------------------------------------------------------------------ process group and dist_state
@@ -633,6 +682,76 @@ def test_a_sharded_nemotron_vl_model_previews_in_lockstep(monkeypatch, plan, loc
     assert recorded["text_keeps_the_experts"] and recorded["image_keeps_the_experts"]
     assert "_optimize_model_for_decode" not in vars(model)
     assert model.calls[0].get("synced_gpus", False) == lockstep  # the fallback generate
+
+
+def test_the_offline_specdec_loader_is_split_across_ranks_too(hf_ptq):
+    """It wraps its DataLoader to move each batch onto the device; each rank still calibrates on
+    its own share, as it would from the bare loader."""
+
+    def loader():
+        return DataLoader(list(range(8)), batch_size=1, collate_fn=lambda b: {"x": torch.tensor(b)})
+
+    wrapped = hf_ptq._DeviceDataLoader(loader(), torch.device("cpu"))
+
+    shard = hf_ptq._shard_calib_dataloader(wrapped, 1, 2)
+
+    assert isinstance(shard, hf_ptq._DeviceDataLoader)
+    assert [b["x"].tolist() for b in shard] == [
+        b["x"].tolist() for b in dist.shard_dataloader(loader(), 1, 2)
+    ]
+    with pytest.raises(NotImplementedError, match="cannot be split"):
+        hf_ptq._shard_calib_dataloader(iter(loader()), 1, 2)
+
+
+@pytest.mark.parametrize(
+    ("plan", "raises"),
+    [(DistributionPlan(4), False), (DistributionPlan(4, ep_size=4), True)],
+    ids=["replicated", "expert_parallel"],
+)
+def test_a_failed_preview_of_a_sharded_model_stops_the_run(hf_ptq, monkeypatch, plan, raises):
+    """A rank that skipped a sharded model's preview would leave the others decoding in lockstep,
+    blocked in the next step's collective, so the failure is raised, which aborts the run. A model
+    every rank holds whole keeps the best-effort skip."""
+
+    class _FailingModel(torch.nn.Module):
+        def generate(self, *args, **kwargs):
+            raise RuntimeError("the preview failed on this rank")
+
+    model = _FailingModel()
+    set_distribution_plan(model, plan)
+    monkeypatch.setattr(hf_ptq, "export_quantized", lambda *args, **kwargs: None)
+    ids = torch.zeros(1, 4, dtype=torch.long)
+    args = SimpleNamespace(specdec_offline_dataset=None, verbose=False)
+    run = lambda: hf_ptq.post_quantize(  # noqa: E731
+        args, model, model, "llama", None, None, ids, None, ids, False, None, None
+    )
+
+    if raises:
+        with pytest.raises(RuntimeError, match="failed on this rank"):
+            run()
+    else:
+        with pytest.warns(UserWarning, match="sanity check failed"):
+            run()
+
+
+@pytest.mark.parametrize(("lockstep", "raises"), [({}, False), ({"synced_gpus": True}, True)])
+def test_a_failed_text_only_vl_preview_stops_a_sharded_run(monkeypatch, lockstep, raises):
+    monkeypatch.syspath_prepend(str(_EXAMPLES_DIR))
+    vlm_utils = importlib.import_module("vlm_utils")
+
+    class _ChatModel:
+        def chat(self, *args, **kwargs):
+            raise RuntimeError("the preview failed on this rank")
+
+    run = lambda: vlm_utils.run_text_only_generation(  # noqa: E731
+        _ChatModel(), None, "question", dict(lockstep), _CKPT
+    )
+
+    if raises:
+        with pytest.raises(RuntimeError, match="failed on this rank"):
+            run()
+    else:
+        assert run() is None
 
 
 @pytest.mark.parametrize("generation_kwargs", [None, {"synced_gpus": True}])
