@@ -1466,9 +1466,10 @@ def _ckpt_quant_method(cfg):
     """Return the checkpoint's native quantization method, or ``None``.
 
     Return the checkpoint's native quantization method (e.g. ``"fp8"`` for block-fp8 DeepSeek-V3),
-    or ``None`` if the checkpoint isn't natively quantized. Checks the top config and the VLM ``text_config``.
+    or ``None`` if the checkpoint isn't natively quantized. Checks the top config, then a VLM's
+    ``text_config`` or ``llm_config``.
     """
-    for c in (cfg, getattr(cfg, "text_config", None)):
+    for c in (cfg, getattr(cfg, "text_config", None), getattr(cfg, "llm_config", None)):
         qc = getattr(c, "quantization_config", None)
         m = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
         if m:
@@ -1556,6 +1557,7 @@ def load_and_prepare_ep(
     """
     from modelopt.torch.utils.distributed import ParallelState, is_initialized, is_master, size
     from modelopt.torch.utils.moe import (
+        _EXPERTS_STYLES,
         _ep_config,
         _routed_expert_keys,
         _routed_expert_modules,
@@ -1604,7 +1606,18 @@ def load_and_prepare_ep(
             f"unquantized checkpoints and dequantizes {dequantized}. Start from an unquantized copy "
             "of the model."
         )
-    dtype = getattr(hf_config, "torch_dtype", None) or torch.bfloat16
+    # The swapped plan is this load's own: the caller's config keeps the plan its checkpoint declares.
+    hf_config = copy.deepcopy(hf_config)
+    ep_cfg = _ep_config(hf_config)  # for VLMs the plan lives on .text_config
+    ep_plan = dict(getattr(ep_cfg, "base_model_ep_plan", None) or {})
+    if not ep_plan:
+        raise ValueError("expert-parallel PTQ requires the model to declare base_model_ep_plan")
+    if not _routed_expert_keys(ep_plan):
+        raise ValueError(
+            f"base_model_ep_plan={ep_plan} styles no routed experts ({', '.join(_EXPERTS_STYLES)} "
+            "or grouped_gemm), so this load would leave them whole on every rank."
+        )
+    dtype = getattr(hf_config, "dtype", None) or torch.bfloat16
     # The weights load, and the checkpoint recorded for the export to read the unplaced tensors back
     # from, take the local snapshot: a Hub ID recorded there would leave the export nothing to read.
     # Resolved once the plan and the config pass, so a refused load downloads nothing.
@@ -1658,7 +1671,7 @@ def load_and_prepare_ep(
         from_pretrained_kwargs["tp_plan"] = "auto"
     if attn_implementation is not None:
         from_pretrained_kwargs["attn_implementation"] = attn_implementation
-    if _ckpt_quant_method(hf_config) == "mxfp4":
+    if quant_method == "mxfp4":
         # Native mxfp4 checkpoints (e.g. gpt-oss: fused `gate_up_proj_blocks`/`_scales` + biases) must be
         # DEQUANTIZED to bf16 on load so ModelOpt can insert nvfp4/fp8 quantizers on the fused bf16 experts
         # (the a2a grouped_gemm expects bf16). transformers dequantizes blocks->bf16 during from_pretrained.
@@ -1673,12 +1686,6 @@ def load_and_prepare_ep(
                 "[ep] native mxfp4 checkpoint (e.g. gpt-oss) -> Mxfp4Config(dequantize=True) -> bf16",
                 flush=True,
             )
-    # The swapped plan is this load's own: the caller's config keeps the plan its checkpoint declares.
-    hf_config = copy.deepcopy(hf_config)
-    ep_cfg = _ep_config(hf_config)  # for VLMs the plan lives on .text_config
-    ep_plan = dict(getattr(ep_cfg, "base_model_ep_plan", None) or {})
-    if not ep_plan:
-        raise ValueError("expert-parallel PTQ requires the model to declare base_model_ep_plan")
     # DP=EP all-to-all: swap the ep_plan to our torch_a2a styles (torch_a2a_router emits GLOBAL ids
     # unmasked; torch_a2a_experts injects the EP process_group + skips the all-reduce) and select the
     # `torch_a2a` experts forward (NCCL all-to-all dispatch/combine around the quantizable
@@ -1709,7 +1716,7 @@ def load_and_prepare_ep(
     # exported and the generation preview works -- chosen as the distribution plan's decision chose
     # it. The per-model plugin (models/) has already installed any on-the-fly weight decompression as
     # a transformers monkeypatch.
-    loader = _auto_class(hf_config, require_lm_head)
+    loader = _auto_class(hf_config, require_lm_head, trust_remote_code=trust_remote_code)
     if is_master():
         print(f"[ep] loader={loader.__name__} (require_lm_head={require_lm_head})", flush=True)
     with _experts_sharded_over(ep_submesh):
@@ -1720,7 +1727,7 @@ def load_and_prepare_ep(
     # `config._experts_implementation` at FORWARD time, so set it on every (sub)config now. (Without
     # this the torch_a2a_experts style passes a 5th process_group arg to grouped_mm_experts_forward ->
     # TypeError.)
-    for _m in [model, *model.modules()]:
+    for _m in model.modules():
         _cfg = getattr(_m, "config", None)
         if _cfg is not None and hasattr(_cfg, "_experts_implementation"):
             _cfg._experts_implementation = "torch_a2a"

@@ -101,6 +101,23 @@ def _model_with_decoder_at(prefix):
 
 # ------------------------------------------------------------------------------- the plan
 
+_EP_PLAN = {"layers.*.mlp.gate": "ep_router", "layers.*.mlp.experts": "moe_tp_experts"}
+
+
+@pytest.fixture
+def ep_world_of_two(monkeypatch):
+    """A two-rank expert-parallel world as far as the loader's checks see, and the checkpoint paths
+    it resolves; nothing else is set up."""
+    resolved = []
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
+    monkeypatch.setattr(
+        model_load_utils, "_resolve_checkpoint_dir", lambda p, r: resolved.append(p) or p
+    )
+    return resolved
+
 
 @pytest.mark.parametrize(
     ("plan", "error", "match"),
@@ -143,29 +160,85 @@ def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch):
 
     with pytest.raises(_ResolvedError):
         load_and_prepare_ep(
-            "org/model", DistributionPlan(2, ep_size=2), hf_config=SimpleNamespace()
+            "org/model",
+            DistributionPlan(2, ep_size=2),
+            hf_config=SimpleNamespace(base_model_ep_plan=_EP_PLAN),
         )
 
     assert resolved == ["org/model"]
 
 
-@pytest.mark.parametrize("quant_method", ["gptq", "modelopt", "compressed-tensors"])
-def test_a_checkpoint_format_the_load_cannot_dequantize_is_refused(monkeypatch, quant_method):
-    """transformers' own quantizer would load it as stored, for PTQ to treat as plain weights; the
-    load refuses it before anything is read."""
-    resolved = []
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "size", lambda group=None: 2)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
-    monkeypatch.setattr(
-        model_load_utils, "_resolve_checkpoint_dir", lambda p, r: resolved.append(p)
-    )
-    config = SimpleNamespace(quantization_config={"quant_method": quant_method})
-
-    with pytest.raises(NotImplementedError, match=f"cannot dequantize a '{quant_method}'"):
+@pytest.mark.parametrize(
+    ("config", "error", "match"),
+    [
+        *(
+            (
+                SimpleNamespace(quantization_config={"quant_method": method}),
+                NotImplementedError,
+                f"cannot dequantize a '{method}'",
+            )
+            for method in ("gptq", "modelopt", "compressed-tensors")
+        ),
+        (SimpleNamespace(), ValueError, "declare base_model_ep_plan"),
+        (
+            SimpleNamespace(base_model_ep_plan={"layers.*.self_attn.q_proj": "colwise"}),
+            ValueError,
+            "styles no routed experts",
+        ),
+    ],
+    ids=["gptq", "modelopt", "compressed-tensors", "no-ep-plan", "no-routed-experts"],
+)
+def test_a_config_the_load_cannot_take_is_refused_before_anything_loads(
+    ep_world_of_two, config, error, match
+):
+    """A format transformers' own quantizer would load as stored, for PTQ to treat as plain weights,
+    or a plan that leaves the experts whole on every rank; the load refuses either before it reads
+    anything."""
+    with pytest.raises(error, match=match):
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
-    assert resolved == []
+    assert ep_world_of_two == []
+
+
+def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of_two, monkeypatch):
+    """The checkpoint's ``dtype`` reaches ``from_pretrained``, and the class that builds it is chosen
+    with the trust the caller gave its code."""
+
+    class _Mesh:
+        device_type = "cpu"
+
+        def __getitem__(self, name):
+            return self
+
+        def size(self):
+            return 2
+
+    class _LoadedError(Exception):
+        """Stops the load at from_pretrained."""
+
+    loaded, classes = {}, []
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            loaded.update(kwargs)
+            raise _LoadedError
+
+    def auto_class(hf_config, require_lm_head=True, trust_remote_code=False):
+        classes.append(trust_remote_code)
+        return _Loader
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", auto_class)
+    config = SimpleNamespace(dtype=torch.float16, base_model_ep_plan=_EP_PLAN)
+
+    with pytest.raises(_LoadedError):
+        load_and_prepare_ep(
+            "org/model", DistributionPlan(2, ep_size=2), trust_remote_code=True, hf_config=config
+        )
+    assert loaded["dtype"] is torch.float16
+    assert classes == [True]
 
 
 # ------------------------------------------------------------------------ quant wrappers
@@ -287,6 +360,12 @@ def test_the_expert_parallel_mesh_comes_with_an_expert_parallel_plan_only(plan, 
         ),
         (
             SimpleNamespace(
+                llm_config=SimpleNamespace(quantization_config={"quant_method": "fp8"})
+            ),
+            "fp8",
+        ),
+        (
+            SimpleNamespace(
                 quantization_config={"quant_method": "mxfp4"},
                 text_config=SimpleNamespace(quantization_config={"quant_method": "fp8"}),
             ),
@@ -300,6 +379,7 @@ def test_the_expert_parallel_mesh_comes_with_an_expert_parallel_plan_only(plan, 
         "dict",
         "object",
         "vlm-text-config",
+        "vlm-llm-config",
         "top-level-wins",
         "transformers-config-object",
         "no-method",
@@ -307,7 +387,7 @@ def test_the_expert_parallel_mesh_comes_with_an_expert_parallel_plan_only(plan, 
     ],
 )
 def test_quant_method_comes_from_the_config_or_a_vlms_text_config(config, expected):
-    """The top-level config first, else a VLM's text config. A loaded model's config holds
+    """The top-level config first, else a VLM's text or LLM config. A loaded model's config holds
     transformers' config object, not the JSON dict, and callers compare against ``"fp8"`` /
     ``"mxfp4"``: it reports the plain method name, not its enum."""
     assert _ckpt_quant_method(config) == expected

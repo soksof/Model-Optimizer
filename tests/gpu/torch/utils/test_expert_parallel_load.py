@@ -36,6 +36,7 @@ from modelopt.torch.utils.distributed import (
     distribution_plan,
     set_distribution_plan,
 )
+from modelopt.torch.utils.moe import expert_parallel_mesh
 from modelopt.torch.utils.plugins.model_load_utils import load_and_prepare_ep
 
 NUM_EXPERTS = 8
@@ -73,6 +74,8 @@ def _sharded_model_matches_the_whole_one(rank, size, ckpt_dir, ep_degree):
     with pytest.raises(RuntimeError, match="no distribution plan recorded"):
         distribution_plan(model)
     set_distribution_plan(model, plan)
+    # Calibration re-installs the all-to-all over the mesh transformers keeps on the model.
+    assert expert_parallel_mesh(model).size() == ep_degree
     whole = AutoModelForCausalLM.from_pretrained(ckpt_dir, dtype=torch.bfloat16).to(device).eval()
 
     # Each rank holds its contiguous share of every layer's experts within its EP group, whose
