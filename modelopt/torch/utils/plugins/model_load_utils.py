@@ -1157,13 +1157,13 @@ def parallel_load_and_prepare_fsdp2(
 def _auto_class(hf_config, require_lm_head: bool = True, trust_remote_code: bool = False) -> Any:
     """The auto class that builds ``hf_config``'s whole model.
 
-    A causal LM builds through ``AutoModelForCausalLM``. A VLM -- a nested text config, a vision
-    config, or a ``*ForConditionalGeneration`` architecture -- builds through ``AutoModel``, which
-    leaves its LM head out. ``require_lm_head`` builds it with the head: through the remote
-    ``AutoModelForCausalLM`` when the checkpoint registers its ``*ForConditionalGeneration`` there,
-    its code is trusted and it registers no image-text class, else through
-    ``AutoModelForImageTextToText`` if that recognizes the config or, its code trusted, the
-    checkpoint registers one.
+    A causal LM builds through ``AutoModelForCausalLM``, head included: ``require_lm_head`` only
+    applies to a VLM -- a nested text config, a vision config, or a ``*ForConditionalGeneration``
+    architecture. A VLM builds through ``AutoModel``, which leaves its LM head out, unless
+    ``require_lm_head``: then through the remote ``AutoModelForCausalLM`` when the checkpoint
+    registers its ``*ForConditionalGeneration`` there, its code is trusted and it registers no
+    image-text class, else through ``AutoModelForImageTextToText`` if that recognizes the config
+    or, its code trusted, the checkpoint registers one, else still through ``AutoModel``.
     """
     architectures = getattr(hf_config, "architectures", None) or []
     is_vlm = (
@@ -1413,7 +1413,9 @@ def _refuse_unquantizable_experts(expert_modules) -> None:
     wrapper of their own, like Llama4's, ``mtq.quantize`` would convert to it, and its forward drops
     the process group the all-to-all transport passes in. The generic fused-experts wrapper is no
     bar: it quantizes through the grouped GEMM, and ``mtq.quantize`` registers it, for the whole
-    process, for every fused-experts class it meets, so a second load of the same class sees it.
+    process, for every fused-experts class it meets, so a second load of the same class sees it. A
+    fused-experts wrapper that quantizes on the eager forward only, like FP8's, is refused: the
+    transport runs the grouped GEMM.
     """
     transposed = sorted(
         {type(m).__name__ for m in expert_modules if getattr(m, "is_transposed", False)}
@@ -1432,14 +1434,18 @@ def _refuse_unquantizable_experts(expert_modules) -> None:
             type(m).__name__
             for m in expert_modules
             if type(m) in QuantModuleRegistry
-            and not issubclass(QuantModuleRegistry[type(m)], _QuantFusedExperts)
+            and (
+                not issubclass(wrapper := QuantModuleRegistry[type(m)], _QuantFusedExperts)
+                or wrapper._eager_only
+            )
         }
     )
     if wrapped:
         raise NotImplementedError(
             f"Expert-parallel PTQ cannot quantize {', '.join(wrapped)}: ModelOpt quantizes these "
             "experts through a wrapper of their own, whose forward drops the expert-parallel "
-            "transport. Quantize the model without expert parallelism."
+            "transport, or on their eager forward only, which the transport does not run. Quantize "
+            "the model without expert parallelism."
         )
 
 
@@ -1459,6 +1465,7 @@ def _seed_parallel_states(model: nn.Module, expert_names, dense_state, expert_st
 
 
 # The checkpoint formats load_and_prepare_ep dequantizes as it loads, beside unquantized ones (None).
+# mxfp4 is for experts stored in the standard layout: GPT-OSS's are transposed, which the load refuses.
 _EP_SOURCE_FORMATS = frozenset({None, "mxfp4"})
 
 
@@ -1501,7 +1508,7 @@ def _experts_sharded_over(ep_mesh):
         yield
         return
 
-    def _ep_mesh(distributed_config):
+    def _ep_mesh(*args, **kwargs):
         index = torch.cuda.current_device() if ep_mesh.device_type == "cuda" else None
         return torch.device(ep_mesh.device_type, index), ep_mesh
 
@@ -1529,7 +1536,7 @@ def load_and_prepare_ep(
     does (:func:`~modelopt.torch.utils.distributed.set_distribution_plan`), as
     :func:`load_pretrained` does for every load.
 
-    Builds a ``(dp, ep)`` device mesh and loads experts EP-sharded over the ``ep`` submesh
+    Builds an ``(edp, ep)`` device mesh and loads experts EP-sharded over the ``ep`` submesh
     (``enable_expert_parallel=True`` -- each rank owns ``num_experts / ep`` experts as grouped-GEMM
     shards), while ATTENTION and dense params stay REPLICATED (so EP has no KV-head-divisibility cap).
     The model's ``base_model_ep_plan`` is swapped to the ``torch_a2a`` styles: the router emits GLOBAL
@@ -1538,11 +1545,11 @@ def load_and_prepare_ep(
     rank computing all tokens followed by an EP all-reduce. Every rank is data-parallel (sees DIFFERENT
     tokens), so calibration MUST shard the data per-rank.
 
-    The ``dp`` dimension (present when ``plan.ep_size < world_size``) is additional data parallelism across
-    EP groups: non-expert params stay REPLICATED per rank and each EP group calibrates on different
-    data; experts stay EP-sharded (resident). No FSDP and no concurrent ``mesh_dp``/``mesh_ep``
+    The ``edp`` dimension (present when ``plan.ep_size < world_size``) is additional data parallelism
+    across EP groups: non-expert params stay REPLICATED per rank and each EP group calibrates on
+    different data; experts stay EP-sharded (resident). No FSDP and no concurrent ``edp``/``ep``
     collectives -> no deadlock by construction. Costs more per-rank memory (non-experts + experts
-    replicated across dp) but is the reliable path at scale.
+    replicated across edp) but is the reliable path at scale.
 
     EP CANNOT be applied to a meta-init model (transformers' ``GroupedGemmParallel.shard_tensor``
     slices materialized tensors), so this loads real weights via ``from_pretrained`` over the ``ep``
@@ -1591,7 +1598,7 @@ def load_and_prepare_ep(
     from transformers import AutoConfig
     from transformers.distributed import DistributedConfig
 
-    world_size, ep_degree, dp = plan.world_size, plan.ep_size, plan.edp
+    world_size, ep_degree, edp = plan.world_size, plan.ep_size, plan.edp
     if hf_config is None:
         config_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
         if attn_implementation is not None:
@@ -1628,9 +1635,9 @@ def load_and_prepare_ep(
     #   sparse_moe_mesh = (edp, ep): experts are SHARDED over the ``ep`` axis and REPLICATED over ``edp``;
     #       the ``ep`` submesh also drives from_pretrained's expert sharding + the a2a transport.
     #   dense_mesh = (dp,): dense/non-expert params are data-parallel-REPLICATED over the WHOLE world.
-    # This subsumes the old a2a-vs-partial split: a2a is simply dp == 1 (``edp`` size 1), and dense amax
+    # This subsumes the old a2a-vs-partial split: a2a is simply edp == 1, and dense amax
     # always reduces over the whole world (fixing the DP>1 case, where the old dp submesh missed the ep dim).
-    sparse_moe_mesh = init_device_mesh("cuda", (dp, ep_degree), mesh_dim_names=("edp", "ep"))
+    sparse_moe_mesh = init_device_mesh("cuda", (edp, ep_degree), mesh_dim_names=("edp", "ep"))
     dense_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
     ep_submesh = sparse_moe_mesh["ep"]
 
@@ -1712,10 +1719,10 @@ def load_and_prepare_ep(
     from_pretrained_kwargs["config"] = hf_config
     if is_master():
         print(f"[ep] ep_plan={swapped_plan} experts_implementation=torch_a2a", flush=True)
-    # The class that builds the whole checkpoint -- with its lm_head, so the head is calibrated and
-    # exported and the generation preview works -- chosen as the distribution plan's decision chose
-    # it. The per-model plugin (models/) has already installed any on-the-fly weight decompression as
-    # a transformers monkeypatch.
+    # The class that builds the whole checkpoint -- with its lm_head where an auto class builds one,
+    # so the head is calibrated and exported and the generation preview works -- chosen as the
+    # distribution plan's decision chose it. The per-model plugin (models/) has already installed
+    # any on-the-fly weight decompression as a transformers monkeypatch.
     loader = _auto_class(hf_config, require_lm_head, trust_remote_code=trust_remote_code)
     if is_master():
         print(f"[ep] loader={loader.__name__} (require_lm_head={require_lm_head})", flush=True)
@@ -1748,6 +1755,12 @@ def load_and_prepare_ep(
     # The routed-expert containers, from the SAME base_model_ep_plan that drove the sharding. A MoE model
     # loaded WITHOUT EP (dense DP) never reaches this loader, so its experts stay dense.
     expert_modules = _routed_expert_modules(model, ep_plan)
+    if not expert_modules:
+        raise ValueError(
+            f"base_model_ep_plan={ep_plan} names routed-expert containers that no module of "
+            f"{type(model).__name__} matches, so calibration would reduce the experts' amax over "
+            "ranks holding different experts. Quantize the model without expert parallelism."
+        )
     _refuse_unquantizable_experts(expert_modules.values())
 
     # Each module's ParallelState for calibration's amax sync: dense modules reduce over the whole world;

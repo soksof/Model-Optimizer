@@ -22,6 +22,7 @@ over, and ``_ckpt_quant_method`` reads the checkpoint's native quantization. Eve
 CPU process.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -102,6 +103,18 @@ def _model_with_decoder_at(prefix):
 # ------------------------------------------------------------------------------- the plan
 
 _EP_PLAN = {"layers.*.mlp.gate": "ep_router", "layers.*.mlp.experts": "moe_tp_experts"}
+
+
+class _Mesh:
+    """A device mesh, as far as the loader reads one before it seeds the experts' parallel state."""
+
+    device_type = "cpu"
+
+    def __getitem__(self, name):
+        return self
+
+    def size(self):
+        return 2
 
 
 @pytest.fixture
@@ -199,18 +212,32 @@ def test_a_config_the_load_cannot_take_is_refused_before_anything_loads(
     assert ep_world_of_two == []
 
 
+def test_a_plan_whose_expert_containers_match_no_module_is_refused(ep_world_of_two, monkeypatch):
+    """A plan that styles the grouped-GEMM parameters a level below the experts names a container no
+    module is. Loaded anyway, every module would get the dense state, and the experts' amax would
+    reduce over ranks holding different experts."""
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            return _model_with_decoder_at("model.")
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+    monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
+    config = SimpleNamespace(
+        base_model_ep_plan={"layers.*.mlp.experts.*.gate_up_proj": "grouped_gemm"}
+    )
+
+    with pytest.raises(ValueError, match="that no module of"):
+        load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+
+
 def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of_two, monkeypatch):
     """The checkpoint's ``dtype`` reaches ``from_pretrained``, and the class that builds it is chosen
     with the trust the caller gave its code."""
-
-    class _Mesh:
-        device_type = "cpu"
-
-        def __getitem__(self, name):
-            return self
-
-        def size(self):
-            return 2
 
     class _LoadedError(Exception):
         """Stops the load at from_pretrained."""
@@ -274,17 +301,27 @@ def test_routed_experts_with_a_quant_wrapper_of_their_own_are_refused(quant_wrap
     assert _SharedExperts in quant_wrappers
 
 
-def test_routed_experts_under_the_generic_fused_wrapper_are_accepted():
+@pytest.mark.parametrize(
+    ("wrapper", "outcome"),
+    [
+        ("_QuantFusedExperts", nullcontext()),
+        ("_QuantFP8Experts", pytest.raises(NotImplementedError, match="on their eager forward")),
+    ],
+    ids=["grouped-gemm", "eager-only"],
+)
+def test_routed_experts_under_a_fused_experts_wrapper(wrapper, outcome):
     """mtq.quantize registers the generic fused-experts wrapper, for the whole process, for every
     fused-experts class it meets, and that wrapper quantizes through the grouped GEMM: a second
-    expert-parallel load of the same class is not refused for it."""
+    expert-parallel load of the same class is not refused for it. FP8's applies its block scales on
+    the eager forward only, which the all-to-all transport does not run: refused."""
     from modelopt.torch.quantization.nn.modules.quant_module import QuantModuleRegistry
-    from modelopt.torch.quantization.plugins.huggingface import _QuantFusedExperts
+    from modelopt.torch.quantization.plugins import huggingface
 
     model = _model_with_decoder_at("model.")
-    QuantModuleRegistry.register({_Experts: "test._Experts"})(_QuantFusedExperts)
+    QuantModuleRegistry.register({_Experts: "test._Experts"})(getattr(huggingface, wrapper))
     try:
-        _refuse_unquantizable_experts([layer.mlp.experts for layer in model.model.layers])
+        with outcome:
+            _refuse_unquantizable_experts([layer.mlp.experts for layer in model.model.layers])
     finally:
         QuantModuleRegistry.unregister(_Experts)
 
@@ -342,6 +379,16 @@ def test_the_expert_parallel_mesh_comes_with_an_expert_parallel_plan_only(plan, 
     model._device_mesh = mesh = object()
 
     assert expert_parallel_mesh(model) is (mesh if is_expert_parallel else None)
+
+
+def test_an_expert_parallel_model_without_its_mesh_is_refused():
+    """A model recorded expert-parallel that load_and_prepare_ep did not load has no mesh for
+    calibration to re-install the all-to-all forwards over; it is refused by name."""
+    model = _model_with_decoder_at("model.")
+    set_distribution_plan(model, DistributionPlan(2, ep_size=2))
+
+    with pytest.raises(RuntimeError, match="carries no device mesh"):
+        expert_parallel_mesh(model)
 
 
 # --------------------------------------------------------------------------- _ckpt_quant_method

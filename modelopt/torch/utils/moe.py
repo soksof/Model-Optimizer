@@ -484,4 +484,10 @@ def expert_parallel_mesh(model: nn.Module):
     """
     if not distribution_plan(model).is_expert_parallel:
         return None
-    return model._device_mesh
+    mesh = getattr(model, "_device_mesh", None)
+    if mesh is None:
+        raise RuntimeError(
+            f"{type(model).__name__} is planned expert-parallel but carries no device mesh; load it "
+            "with load_and_prepare_ep, which shards its experts over one."
+        )
+    return mesh
