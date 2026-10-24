@@ -42,7 +42,7 @@ from transformers import DeepseekV3Config, DeepseekV3ForCausalLM, PretrainedConf
 
 from modelopt.torch.models import _onfly_decompress, get_spec
 from modelopt.torch.models.kimi_k25 import ep as kimi_k25
-from modelopt.torch.utils.moe import _routed_expert_keys
+from modelopt.torch.utils.moe import _routed_expert_keys, check_distributed_support
 
 QUANT = {"quant_method": "compressed-tensors", "format": "pack-quantized"}
 REMOTE = "transformers_modules.Kimi_hyphen_K2_dot_7.0123abcd"  # how the loader names remote code
@@ -87,8 +87,7 @@ def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkey
     """The text config becomes transformers' own ``DeepseekV3Config`` (no remote ``auto_map``, no
     stale ``quantization_config``) with an EP plan for the fused experts, naming the experts the
     spec states for a run that skips prepare; the decompressor is installed while the VLM config
-    still carries the compressed-tensors scheme; the remote-code staging shim is left installed;
-    without a checkpoint nothing remote is imported."""
+    still carries the compressed-tensors scheme; the remote-code staging shim is left installed."""
     installs = []
     monkeypatch.setattr(
         _onfly_decompress,
@@ -98,7 +97,7 @@ def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkey
     staging = dmu.get_cached_module_file
     config = _vlm_config()
 
-    assert kimi_k25.prepare(config) is config
+    assert kimi_k25.prepare(config, ckpt_path="/ckpt", trust_remote_code=True) is config
 
     text = config.text_config
     assert type(text) is DeepseekV3Config
@@ -112,7 +111,6 @@ def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkey
     )
     assert installs == [QUANT]
     assert dmu.get_cached_module_file is not staging
-    assert remote.loads == []
 
 
 def test_prepare_with_a_checkpoint_points_the_remote_modeling_at_native_deepseek_v3(
@@ -133,6 +131,15 @@ def test_prepare_with_a_checkpoint_points_the_remote_modeling_at_native_deepseek
     ]
     assert remote.DeepseekV3ForCausalLM is DeepseekV3ForCausalLM
     assert bystander.DeepseekV3ForCausalLM is remote_lm
+
+
+def test_a_transformers_too_old_to_decompress_is_refused_before_prepare(monkeypatch):
+    """The experts decompress as they load from transformers 5.8: the spec refuses an older
+    release before prepare swaps the language model's config."""
+    monkeypatch.setattr(transformers, "__version__", "5.7.0")
+
+    with pytest.raises(RuntimeError, match=r"transformers >= 5\.8"):
+        check_distributed_support("kimi_k25")
 
 
 def test_prepare_refuses_transformers_own_port():

@@ -31,7 +31,10 @@ register(
         # transformers ships Kimi-K2.5 itself from 5.13. Expert parallelism still runs on the
         # checkpoint's own code (``trust_remote_code=True``), which ``prepare`` patches.
         min_transformers_version="5.13",
-        # prepare swaps a native deepseek_v3 in as the language model, with deepseek_v3's plan.
-        ep_spec=EPSpec(prepare=prepare, prepared_ep_plan=BASE_MODEL_EP_PLAN),
+        # prepare swaps a native deepseek_v3 in as the language model, with deepseek_v3's plan,
+        # and decompresses the experts as they load, which needs transformers 5.8.
+        ep_spec=EPSpec(
+            prepare=prepare, prepared_ep_plan=BASE_MODEL_EP_PLAN, requires_transformers="5.8"
+        ),
     )
 )

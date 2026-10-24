@@ -129,7 +129,7 @@ def test_prepare_rebuilds_the_language_model_config_without_a_decompressor(monke
     staging = dmu.get_cached_module_file
     config = _vlm_config()
 
-    assert kimi_vl.prepare(config) is config
+    assert kimi_vl.prepare(config, ckpt_path="/ckpt", trust_remote_code=True) is config
 
     text = config.text_config
     assert type(text) is DeepseekV3Config
@@ -142,7 +142,6 @@ def test_prepare_rebuilds_the_language_model_config_without_a_decompressor(monke
     )
     assert import_utils.is_torch_fx_available() is False
     assert dmu.get_cached_module_file is not staging
-    assert remote.loads == []
 
 
 @pytest.mark.parametrize(
@@ -202,11 +201,14 @@ def test_the_swap_fails_loudly_when_the_remote_modeling_did_not_load(monkeypatch
     ("config", "kwargs", "match"),
     [
         (SimpleNamespace, {}, "text_config"),
+        # Without the checkpoint there is no modeling code to patch, and a half-prepared config
+        # would load Kimi's own language model under a plan naming none of its experts.
+        (_vlm_config, {"trust_remote_code": True}, "needs the checkpoint's path"),
         # transformers' get_class_from_dynamic_module runs the checkpoint's code without checking
         # trust_remote_code, so prepare must refuse before reaching it.
         (_vlm_config, {"ckpt_path": "/ckpt"}, "trust_remote_code=True"),
     ],
-    ids=["no-text-config", "untrusted-checkpoint"],
+    ids=["no-text-config", "no-checkpoint", "untrusted-checkpoint"],
 )
 def test_prepare_refuses_before_patching_anything(monkeypatch, adapter, config, kwargs, match):
     """Before prepare patches anything process-wide, such as the loader's remote-code staging, or

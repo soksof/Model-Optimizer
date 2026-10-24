@@ -98,7 +98,12 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     """
     if not hasattr(hf_config, "text_config"):
         raise ValueError("kimi_vl.apply: hf_config has no .text_config (expected a VLM config)")
-    if ckpt_path is not None and not trust_remote_code:
+    if ckpt_path is None:
+        raise ValueError(
+            "kimi_vl: expert parallelism patches the checkpoint's own modeling code, so it needs "
+            "the checkpoint's path (apply_distributed_support's ckpt_path)."
+        )
+    if not trust_remote_code:
         # Patching below imports the checkpoint's own modeling code, and transformers'
         # get_class_from_dynamic_module runs it without checking trust_remote_code itself.
         raise ValueError(
@@ -114,8 +119,7 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     # EP plan onto the native text_config (bubbles up to the VLM root under language_model.*).
     apply_distributed_support("deepseek_v3", hf_config.text_config)
 
-    if ckpt_path is not None:
-        _patch_kimi_vl_modeling_to_native(ckpt_path, trust_remote_code)
+    _patch_kimi_vl_modeling_to_native(ckpt_path, trust_remote_code)
     return hf_config
 
 

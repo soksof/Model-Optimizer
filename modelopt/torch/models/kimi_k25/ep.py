@@ -72,7 +72,12 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
         )
     if not hasattr(hf_config, "text_config"):
         raise ValueError("kimi_k25.apply: hf_config has no .text_config (expected a VLM config)")
-    if ckpt_path is not None and not trust_remote_code:
+    if ckpt_path is None:
+        raise ValueError(
+            "kimi_k25: expert parallelism patches the checkpoint's own modeling code, so it needs "
+            "the checkpoint's path (apply_distributed_support's ckpt_path)."
+        )
+    if not trust_remote_code:
         # Patching below imports the checkpoint's own modeling code, and transformers'
         # get_class_from_dynamic_module runs it without checking trust_remote_code itself.
         raise ValueError(
@@ -105,11 +110,8 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     apply_distributed_support("deepseek_v3", hf_config.text_config)
 
     # 4. Force-load Kimi's modeling_kimi_k25 module (so we can patch its DeepseekV3ForCausalLM
-    #    symbol) and swap to the native class. If ckpt_path isn't available we skip the patch and
-    #    the run will fall back to Kimi's per-expert nn.ModuleList layout (non-EP-capable) -- caller
-    #    should always thread ckpt_path through apply_distributed_support.
-    if ckpt_path is not None:
-        _patch_kimi_modeling_to_native(ckpt_path, trust_remote_code)
+    #    symbol) and swap to the native class.
+    _patch_kimi_modeling_to_native(ckpt_path, trust_remote_code)
     return hf_config
 
 
