@@ -1500,10 +1500,11 @@ def resolve_distribution_plan(
     the checkpoint's, which is then not read: each rank takes a copy, as building writes to it.
 
     Unless rank 0's knobs rule expert parallelism out (a single process, or an EP degree of 1),
-    every rank applies the model's spec to the config first
+    every rank applies the model's spec to a copy of the config first
     (:func:`~modelopt.torch.utils.moe.apply_distributed_support`): for several models it is what
-    supplies the expert-parallel plan, and the returned config carries it. A plan that leaves an
-    expert-parallel MoE whole on every rank raises.
+    supplies the expert-parallel plan, and an expert-parallel plan returns that copy. Any other
+    plan returns the config without it, which the export would otherwise write out. A plan that
+    leaves an expert-parallel MoE whole on every rank raises.
     """
     from modelopt.torch.utils import distributed as dist
     from modelopt.torch.utils.moe import apply_distributed_support
@@ -1541,26 +1542,33 @@ def resolve_distribution_plan(
     # Whether the run rules expert parallelism out is rank 0's call, as the plan is: a rank that
     # skipped the spec while the others applied it would load without the expert-parallel plan
     # they shard by, and fail once the mesh is up, leaving them waiting in a collective.
+    prepared = [hf_config]
     if dist.broadcast_from(
         "spec",
         lambda: world_size > 1 and str(env.ep_degree() if ep_size is None else ep_size) != "1",
     ):
-        # Before deciding: deciding without the spec would read an expert-parallel MoE as dense.
-        hf_config = apply_distributed_support(
-            hf_config.model_type,
-            hf_config,
-            ckpt_path=ckpt_path,
-            trust_remote_code=trust_remote_code,
-        )
+        # Before deciding: deciding without the spec would read an expert-parallel MoE as dense. A
+        # rank that cannot apply it fails every rank, as a checkpoint read does above.
+        def spec_applied() -> bool:
+            prepared[0] = apply_distributed_support(
+                hf_config.model_type,
+                copy.deepcopy(hf_config),
+                ckpt_path=ckpt_path,
+                trust_remote_code=trust_remote_code,
+            )
+            return True
+
+        dist.all_reduce("model spec", spec_applied, all)
     plan = dist.broadcast_from(
         "plan",
         lambda: _decide_distribution(
-            ckpt_path, hf_config, world_size, ep_size, dense, trust_remote_code, auto_class
+            ckpt_path, prepared[0], world_size, ep_size, dense, trust_remote_code, auto_class
         ),
     )
     if plan != DistributionPlan() and dist.is_master():
         print(f"Distribution: {plan!r}", flush=True)
-    return plan, hf_config
+    # Only the expert-parallel load shards by the plan the spec attached.
+    return plan, prepared[0] if plan.is_expert_parallel else hf_config
 
 
 def _make_expert_param_matcher(ep_plan: dict[str, Any]):

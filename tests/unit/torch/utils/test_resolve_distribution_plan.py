@@ -379,7 +379,7 @@ def test_an_ep_capable_moe_is_planned_expert_parallel(run_as, serve, tmp_path, c
     plan, hf_config = resolve_distribution_plan(str(tmp_path))
 
     assert plan == DistributionPlan(4, ep_size=4, dense="replicate")
-    assert hf_config is served
+    assert hf_config.base_model_ep_plan == served.base_model_ep_plan
     assert ("Distribution:" in capsys.readouterr().out) == (rank == 0)
 
 
@@ -425,6 +425,18 @@ def test_the_spec_is_applied_before_the_decision(run_as, serve, tmp_path):
 
     assert plan == DistributionPlan(4, 4)
     assert hf_config.base_model_ep_plan == get_spec("deepseek_v3").ep_spec.base_model_ep_plan
+
+
+def test_only_an_expert_parallel_plan_carries_the_spec_plan_on(run_as, serve, tmp_path):
+    """No EP degree divides 3 experts over 2 ranks, so the whole model is FSDP2-sharded: the config
+    handed on keeps no expert-parallel plan, which the export would write into config.json."""
+    run_as(2)
+    serve(_deepseek_v3(n_routed_experts=3))
+
+    plan, hf_config = resolve_distribution_plan(str(tmp_path), dense="fsdp")
+
+    assert plan == DistributionPlan(2, dense="fsdp")
+    assert hf_config.base_model_ep_plan is None
 
 
 def test_a_run_without_expert_parallelism_needs_no_spec(run_as, serve, monkeypatch, tmp_path):
@@ -815,3 +827,31 @@ def test_a_rank_that_cannot_see_the_checkpoint_fails_every_rank(cpu_dist_workers
     """Before the plan's broadcast, which rank 0 would otherwise wait in for a rank that raised."""
     LlamaConfig(**_TINY).save_pretrained(tmp_path)
     cpu_dist_workers.run(_one_rank_cannot_see_the_checkpoint_job, ckpt=str(tmp_path))
+
+
+def _one_rank_cannot_apply_the_spec_job(rank, size, ckpt):
+    apply = moe.apply_distributed_support
+
+    def apply_on_rank0_only(*args, **kwargs):
+        if rank == 1:
+            raise OSError("this rank cannot import the checkpoint's code")
+        return apply(*args, **kwargs)
+
+    with (
+        bounded_collectives(),
+        mock.patch.object(moe, "apply_distributed_support", apply_on_rank0_only),
+    ):
+        try:
+            resolve_distribution_plan(ckpt)
+        except (OSError, RuntimeError) as error:
+            raised = str(error)
+        else:
+            raised = "no error"
+    assert "cannot import the checkpoint's code" in raised, raised
+
+
+def test_a_rank_that_cannot_apply_the_spec_fails_every_rank(cpu_dist_workers, tmp_path):
+    """A spec's preparation reads the checkpoint and imports its code on each rank, which can fail
+    on one alone; the others must not wait for it in the plan's broadcast."""
+    _deepseek_v3(n_routed_experts=8).save_pretrained(tmp_path)
+    cpu_dist_workers.run(_one_rank_cannot_apply_the_spec_job, ckpt=str(tmp_path))

@@ -209,7 +209,9 @@ def apply_distributed_support(
             if target is None:
                 raise ValueError(
                     f"{model_type} expects its expert-parallel plan on "
-                    f"config.{ep.plan_config_attr}, which this checkpoint's config does not have."
+                    f"config.{ep.plan_config_attr}, which this config does not have: the "
+                    "checkpoint's own code (trust_remote_code=True) names its sub-model config so, "
+                    "and a config built without it may not."
                 )
         if not getattr(target, "base_model_ep_plan", None):
             target.base_model_ep_plan = dict(ep.base_model_ep_plan)

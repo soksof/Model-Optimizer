@@ -21,6 +21,9 @@ What differs is where the expert-parallel plan has to be attached: on the nested
 not the VLM root. transformers aggregates each sub-model's plan up to the root WITH its module
 prefix, so a plan on ``llm_config`` surfaces as ``language_model.<base>.layers.*`` and matches the
 real parameter paths -- while a plan on the top config reaches no expert at all.
+
+Only that plan is registered under the root type: the MoE and export sections stay NemotronH's,
+so lookups by ``nemotron_h_omni`` find neither yet. Sharing them is left to a follow-up.
 """
 
 from ..nemotron_h.specs import BASE_MODEL_EP_PLAN

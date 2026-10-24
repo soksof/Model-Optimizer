@@ -318,8 +318,10 @@ def test_an_expert_parallel_plan_loads_through_the_ep_loader(
     assert (call["ckpt_path"], call["plan"]) == (str(tmp_path), plan)
     assert (call["trust_remote_code"], call["attn_implementation"]) == (True, "eager")
     assert call["freeze"] is False
-    assert call["hf_config"] is served
-    assert served.base_model_ep_plan == get_spec("deepseek_v3").ep_spec.base_model_ep_plan
+    assert (
+        call["hf_config"].base_model_ep_plan == get_spec("deepseek_v3").ep_spec.base_model_ep_plan
+    )
+    assert served.base_model_ep_plan is None
     assert distribution_plan(model) == plan
     assert loaders == {}
     assert auto_class.calls == []
@@ -340,8 +342,9 @@ def test_a_load_prepares_its_config_once(
 ):
     """A model's EP preparation can patch its modeling code, so a load runs it once, and not at all
     when handed the config resolve_distribution_plan prepared. A config passed for the load is the
-    caller's own, so the load prepares a copy of it. Every config it reads takes the Hub options the
-    load was given (custom code an ``auto_map`` names in another repo)."""
+    caller's own, and the one deciding reads may go on to a load that is not expert-parallel, so
+    either is prepared as a copy. Every config it reads takes the Hub options the load was given
+    (custom code an ``auto_map`` names in another repo)."""
     run_as(4)
     config, reads = _deepseek_v3(n_routed_experts=8), []
     as_passed = config.to_dict()
@@ -364,7 +367,7 @@ def test_a_load_prepares_its_config_once(
 
     assert len(prepared) == preparations
     loaded = loaders["ep"]["hf_config"]
-    if passed_as == "config":
+    if passed_as == "config" or not planned:
         assert loaded is not config and loaded.base_model_ep_plan
         assert config.to_dict() == as_passed
     else:
