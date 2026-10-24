@@ -49,6 +49,7 @@ from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
 
 from modelopt.torch.models import _onfly_decompress, get_spec
 from modelopt.torch.models.kimi_k3 import ep as kimi_k3
+from modelopt.torch.utils.moe import check_distributed_support
 
 ROUTES = torch.tensor([[0, 3], [1, 2], [3, 1], [2, 0], [1, 3]])  # top-2 experts of 5 tokens
 
@@ -416,6 +417,17 @@ def test_create_causal_mask_shim_adapts_the_remote_call_once():
     assert remote.calls == [("create_causal_mask", "config", "embeds", "mask_2d", "cache", "ids")]
 
 
+def test_create_causal_mask_shim_keeps_what_a_kwargs_signature_takes():
+    """A ``create_causal_mask`` that takes ``**kwargs`` accepts every keyword: none is dropped."""
+    remote = types.ModuleType("kimi_k3_kwargs_stub")
+    remote.create_causal_mask = lambda config, inputs_embeds, **kwargs: kwargs
+    kimi_k3._shim_create_causal_mask(remote)
+
+    kept = remote.create_causal_mask(config="config", input_embeds="embeds", cache_position=0)
+
+    assert kept == {"cache_position": 0}
+
+
 def test_kimi_cache_mask_sizes_accept_a_query_length_or_a_cache_position():
     """transformers >= 5.13 passes the query length as an int; the remote cache expects a
     ``cache_position`` tensor. Either way kv_length is the query length plus the cached tokens."""
@@ -518,8 +530,30 @@ def test_the_plan_the_conversions_and_the_fused_params_name_the_same_tensors():
 
 # ------------------------------------------------------------------------------------- prepare
 
+_AUTO_MAP = {"AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"}
 
-@pytest.mark.usefixtures("private_conversion_registry")
+
+@pytest.fixture
+def remote_checkpoint(monkeypatch):
+    """The checkpoint's remote code, a fresh stand-in that importing it registers; the shims
+    prepare installs on transformers are undone after the test."""
+    remote = _remote_module("transformers_modules.stub.modeling_kimi_k3")
+
+    def import_remote_class(class_ref, ckpt_path, **kwargs):
+        monkeypatch.setitem(sys.modules, remote.__name__, remote)
+        return remote.KimiK3ForConditionalGeneration
+
+    monkeypatch.setattr(dmu, "get_class_from_dynamic_module", import_remote_class)
+    monkeypatch.setattr(dmu, "get_cached_module_file", dmu.get_cached_module_file)
+    _restore(monkeypatch, hf_generic, "OutputRecorder")
+    return remote
+
+
+def _prepare(config):
+    return kimi_k3.prepare(config, ckpt_path="/ckpt", trust_remote_code=True)
+
+
+@pytest.mark.usefixtures("private_conversion_registry", "remote_checkpoint")
 def test_prepare_sets_the_plan_and_a2a_experts_and_hands_the_quant_config_to_the_decompressor(
     monkeypatch,
 ):
@@ -535,9 +569,9 @@ def test_prepare_sets_the_plan_and_a2a_experts_and_hands_the_quant_config_to_the
     )
     quant = {"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized"}
     text = SimpleNamespace(quantization_config=quant.copy())
-    config = SimpleNamespace(text_config=text, quantization_config=quant.copy())
+    config = SimpleNamespace(text_config=text, quantization_config=quant.copy(), auto_map=_AUTO_MAP)
 
-    assert kimi_k3.prepare(config) is config
+    assert _prepare(config) is config
 
     assert text.base_model_ep_plan == kimi_k3.BASE_MODEL_EP_PLAN
     assert text.base_model_ep_plan is not kimi_k3.BASE_MODEL_EP_PLAN
@@ -551,13 +585,13 @@ def test_prepare_sets_the_plan_and_a2a_experts_and_hands_the_quant_config_to_the
     assert text.quantization_config is None
 
 
-@pytest.mark.usefixtures("private_conversion_registry")
+@pytest.mark.usefixtures("private_conversion_registry", "remote_checkpoint")
 def test_prepare_keeps_a_plan_the_config_already_has(monkeypatch):
     """A plan the checkpoint's config already carries describes its own layout and wins."""
     monkeypatch.setattr(_onfly_decompress, "install_onfly_decompress", lambda cfg: None)
     text = SimpleNamespace(base_model_ep_plan={"layers.*.custom": "grouped_gemm"})
 
-    kimi_k3.prepare(SimpleNamespace(text_config=text))
+    _prepare(SimpleNamespace(text_config=text, auto_map=_AUTO_MAP))
 
     assert text.base_model_ep_plan == {"layers.*.custom": "grouped_gemm"}
 
@@ -630,17 +664,41 @@ def test_prepare_fails_loudly_when_no_loaded_module_defines_the_moe_block(monkey
         )
 
 
-def test_prepare_refuses_an_untrusted_checkpoint(monkeypatch):
-    """transformers' get_class_from_dynamic_module runs the checkpoint's code without checking
-    trust_remote_code, so prepare must refuse before importing it."""
+@pytest.mark.usefixtures("private_conversion_registry")
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        # Without the checkpoint there is no modeling code to patch: the plan and the fusion would
+        # name fused experts the unpatched per-expert modeling never builds.
+        ({"trust_remote_code": True}, "needs the checkpoint's path"),
+        # transformers' get_class_from_dynamic_module runs the checkpoint's code without checking
+        # trust_remote_code.
+        ({"ckpt_path": "/ckpt"}, "trust_remote_code=True"),
+    ],
+    ids=["no-checkpoint", "untrusted-checkpoint"],
+)
+def test_prepare_refuses_before_changing_anything(monkeypatch, kwargs, match):
     monkeypatch.setattr(
         kimi_k3,
         "_force_load_remote_modeling",
         lambda *args: pytest.fail("the checkpoint's code was imported"),
     )
+    text = SimpleNamespace()
 
-    with pytest.raises(ValueError, match="trust_remote_code=True"):
-        kimi_k3.prepare(SimpleNamespace(text_config=SimpleNamespace()), ckpt_path="/ckpt")
+    with pytest.raises(ValueError, match=match):
+        kimi_k3.prepare(SimpleNamespace(text_config=text), **kwargs)
+    assert vars(text) == {}
+    registered = cm.get_checkpoint_conversion_mapping("kimi_linear") or []
+    assert not any("block_sparse_moe.experts.*.w1.weight" in c.source_patterns for c in registered)
+
+
+def test_a_transformers_older_than_the_validated_one_is_refused_before_prepare(monkeypatch):
+    """The spec states the release the adapter's patches were validated against, so a run on an
+    older one is refused, with its way around, before prepare touches anything."""
+    monkeypatch.setattr(transformers, "__version__", "5.12.0")
+
+    with pytest.raises(RuntimeError, match=r"transformers >= 5\.13"):
+        check_distributed_support("kimi_k3")
 
 
 @pytest.mark.usefixtures("private_conversion_registry")
@@ -719,7 +777,7 @@ def test_the_remote_modeling_is_imported_through_the_class_the_auto_map_declares
         kimi_k3._force_load_remote_modeling(config_only, "/ckpt", False)
 
 
-@pytest.mark.usefixtures("private_conversion_registry")
+@pytest.mark.usefixtures("private_conversion_registry", "remote_checkpoint")
 def test_prepare_lets_an_error_reading_the_quant_config_through(monkeypatch):
     """compressed_tensors raises pydantic's ValidationError, a ValueError, for a quantization_config
     it cannot parse. Dropped after that, the config would load the experts newly initialized."""
@@ -728,19 +786,21 @@ def test_prepare_lets_an_error_reading_the_quant_config_through(monkeypatch):
         raise ValueError("1 validation error for QuantizationConfig")
 
     monkeypatch.setattr(_onfly_decompress, "install_onfly_decompress", install)
-    config = SimpleNamespace(text_config=SimpleNamespace(), quantization_config={"format": "new"})
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(), quantization_config={"format": "new"}, auto_map=_AUTO_MAP
+    )
 
     with pytest.raises(ValueError, match="validation error"):
-        kimi_k3.prepare(config)
+        _prepare(config)
 
 
-@pytest.mark.usefixtures("private_conversion_registry", "restore_loader_hooks")
+@pytest.mark.usefixtures("private_conversion_registry", "restore_loader_hooks", "remote_checkpoint")
 def test_prepare_leaves_the_loader_alone_for_bf16_experts():
     """Without a compressed-tensors config the experts are plain bf16: prepare completes and leaves
     transformers' conversion mapping unwrapped, with or without ``compressed_tensors`` installed."""
     stock = mu.get_model_conversion_mapping
 
-    kimi_k3.prepare(SimpleNamespace(text_config=SimpleNamespace()))
+    _prepare(SimpleNamespace(text_config=SimpleNamespace(), auto_map=_AUTO_MAP))
 
     assert mu.get_model_conversion_mapping is stock
 

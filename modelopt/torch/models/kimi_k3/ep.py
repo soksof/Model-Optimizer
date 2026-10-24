@@ -63,8 +63,8 @@ VLM: the plan is set on ``text_config`` and bubbles up under ``language_model.mo
 Also shims ``OutputRecorder`` back into ``transformers.utils.generic`` (the remote code imports it there,
 but it moved to ``transformers.modeling_utils``) so the modeling imports at all.
 
-Version floor: transformers >= 5.8, for the on-the-fly decompression. Developed and validated against
-transformers 5.13 + flash-linear-attention (FLA) 0.5.0, which the remote code's KDA layers need at runtime.
+Version floor: transformers >= 5.13, which it was developed and validated against (the spec declares it),
+with flash-linear-attention (FLA) 0.5.0, which the remote code's KDA layers need at runtime.
 """
 
 import sys
@@ -209,7 +209,8 @@ def _build_fused_experts_class(kmod):
             # DeepseekV3Experts/MiniMaxM3VLExperts reference loop, with situ gating.
             final = torch.zeros_like(hidden_states)
             with torch.no_grad():
-                mask = nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(
+                # One class past the experts: the id a router gives a token routed to no local expert.
+                mask = nn.functional.one_hot(top_k_index, num_classes=self.num_experts + 1).permute(
                     2, 1, 0
                 )
                 hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -259,7 +260,7 @@ def _patch_kimi_moe_block(kmod) -> None:
         identity = hidden_states
         orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         if self.use_latent_moe:
             hidden_states = self.routed_expert_down_proj(hidden_states)
         # Fused / a2a experts: returns the top-k-combined output in the latent space.
@@ -268,7 +269,7 @@ def _patch_kimi_moe_block(kmod) -> None:
             if self.latent_moe_use_norm:
                 y = self.routed_expert_norm(y)
             y = self.routed_expert_up_proj(y)
-        y = y.view(*orig_shape)
+        y = y.reshape(orig_shape)
         if self.config.num_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y
@@ -314,26 +315,14 @@ def _patch_kda_a_log(kmod) -> None:
 
 
 def _patch_kda_beta_sigmoid(kmod) -> None:
-    """Fix the KDA calibration NaN.
+    """Apply the KDA gate's sigmoid in torch, and clear the kernel flag that asks for it.
 
-    The remote ``KimiDeltaAttention.forward`` passes the RAW gate scalar ``beta = b_proj(hidden_states)`` to FLA's
-    ``chunk_kda`` / ``fused_recurrent_kda`` with ``use_beta_sigmoid_in_kernel=True``, expecting the kernel to apply
-    ``sigmoid`` (the delta-rule learning rate must be in ``(0,1)``). In fla-core 0.5.x that flag is a **silent no-op**
-    for the main recurrence -- the kernel uses the raw beta. Real trained weights produce ``beta`` up to ~8.4, so the
-    per-step delta-rule eigenvalue ``|1 - beta*||k||^2|`` exceeds 1 (``beta*||k||^2 ~ 7.7 >> 2``) and the recurrent
-    state grows exponentially (~1e11 over 128 tokens -> ``inf`` -> ``o_norm`` turns it into NaN -> ``detected nan values
-    in amax`` during calibration). Random-weight smokes never tripped it because their beta is small (``beta*||k||^2 <
-    2``). Verified offline on the real layer-1 inputs: pre-applying ``sigmoid(beta)`` and passing
-    ``use_beta_sigmoid_in_kernel=False`` bounds the output (o~0.1, state~4.6, matching the pure-torch
-    ``naive_recurrent_kda`` reference), vs 8e9 unfixed.
-
-    Fix: wrap the module-level ``chunk_kda`` / ``fused_recurrent_kda`` in the remote module; when invoked
-    with ``use_beta_sigmoid_in_kernel=True``, replace ``beta`` with ``beta.sigmoid()`` and set the flag
-    False so the transform happens (correctly) in torch. Idempotent.
+    fla-core 0.5.x silently ignores ``use_beta_sigmoid_in_kernel``, so its ``chunk_kda`` /
+    ``fused_recurrent_kda`` use the raw gate, and on trained weights the delta-rule recurrence
+    (``|1 - beta*||k||^2| > 1``) diverges to inf, a NaN amax in calibration. Random weights keep
+    ``beta`` small enough to hide it. Idempotent.
     """
     import inspect
-
-    import torch
 
     if getattr(kmod, "_kimi_k3_beta_sigmoid_patched", False):
         return
@@ -398,9 +387,15 @@ def _shim_create_causal_mask(kmod) -> None:
     if orig is None or getattr(orig, "_kimi_k3_ccm_shim", False):
         return
     try:
-        accepted = set(inspect.signature(orig).parameters)
+        params = inspect.signature(orig).parameters
     except (TypeError, ValueError):
-        accepted = None
+        params = {}
+    # None: every keyword passes, as for a signature that takes **kwargs.
+    accepted = (
+        set(params)
+        if params and all(p.kind is not inspect.Parameter.VAR_KEYWORD for p in params.values())
+        else None
+    )
 
     @functools.wraps(orig)
     def _wrapped(*args, **kwargs):
@@ -571,10 +566,12 @@ def prepare(
     inserts/calibrates/folds the fp8/nvfp4 quantizers on those bf16 params. That is ~4x the packed HBM
     (the memory bottleneck), but PTQ needs the bf16 weights.
     """
-    from modelopt.torch.utils.moe import require_transformers
-
-    require_transformers("5.8", "kimi_k3 expert-parallel PTQ")
-    if ckpt_path is not None and not trust_remote_code:
+    if ckpt_path is None:
+        raise ValueError(
+            "kimi_k3: expert parallelism patches the checkpoint's own modeling code, so it needs "
+            "the checkpoint's path (apply_distributed_support's ckpt_path)."
+        )
+    if not trust_remote_code:
         # Patching below imports the checkpoint's own modeling code, and transformers'
         # get_class_from_dynamic_module runs it without checking trust_remote_code itself.
         raise ValueError(
@@ -584,25 +581,21 @@ def prepare(
 
     text_cfg = getattr(hf_config, "text_config", None) or hf_config
 
-    # Monkey-patch the remote modeling (needs ckpt_path to force-load it). If ckpt_path is missing we can
-    # only set the config plan; the load would then fall back to the non-EP ModuleList layout -> callers
-    # must thread ckpt_path through apply_distributed_support.
-    if ckpt_path is not None:
-        # This checkpoint's remote code, not whichever revision this process imported first. Every
-        # patch is idempotent, so a repeat prepare for the same checkpoint changes nothing.
-        package = _force_load_remote_modeling(hf_config, ckpt_path, trust_remote_code).__module__
-        package = package.rpartition(".")[0]
-        kmod = _find_remote_module(package)
-        if kmod is None:
-            raise RuntimeError(
-                "kimi_k3: could not locate the loaded remote module defining KimiSparseMoeBlock to patch"
-            )
-        _patch_kimi_moe_block(kmod)
-        _patch_kda_a_log(kmod)
-        _patch_kda_beta_sigmoid(kmod)
-        _shim_create_causal_mask(kmod)
-        _patch_kimi_cache_get_mask_sizes(kmod)
-        _shim_tie_weights_kwargs(package)
+    # This checkpoint's remote code, not whichever revision this process imported first. Every patch
+    # is idempotent, so a repeat prepare for the same checkpoint changes nothing.
+    package = _force_load_remote_modeling(hf_config, ckpt_path, trust_remote_code).__module__
+    package = package.rpartition(".")[0]
+    kmod = _find_remote_module(package)
+    if kmod is None:
+        raise RuntimeError(
+            "kimi_k3: could not locate the loaded remote module defining KimiSparseMoeBlock to patch"
+        )
+    _patch_kimi_moe_block(kmod)
+    _patch_kda_a_log(kmod)
+    _patch_kda_beta_sigmoid(kmod)
+    _shim_create_causal_mask(kmod)
+    _patch_kimi_cache_get_mask_sizes(kmod)
+    _shim_tie_weights_kwargs(package)
 
     if not getattr(text_cfg, "base_model_ep_plan", None):
         # grouped_gemm shards the bf16 fused params; the experts container goes through moe_tp_experts
