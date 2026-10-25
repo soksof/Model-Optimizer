@@ -30,6 +30,7 @@ import torch
 from _test_utils.torch.distributed.utils import bounded_collectives
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.multiprocessing.reductions import StorageWeakRef
 
 pytest.importorskip("safetensors")
 pytest.importorskip("transformers")
@@ -244,6 +245,9 @@ def _refusing_materialize_job(rank, world_size, case):
         # A dim-0 shard over a mesh smaller than the world: each rank's own 1-rank sub-mesh.
         sub = init_device_mesh("cpu", (world_size, 1), mesh_dim_names=("dp", "sub"))["sub"]
         w = distribute_tensor(torch.zeros(4, 3), sub, [Shard(0)])
+    elif case == "size":
+        # A plain buffer rank 1 holds in another dtype: the ranks would assign owners by different sizes.
+        w = torch.zeros(2, dtype=torch.float32 if rank == 0 else torch.bfloat16)
     else:
         mesh = init_device_mesh("cpu", (world_size,))
         if case == "placement":
@@ -278,11 +282,14 @@ def _refusing_materialize_job(rank, world_size, case):
         "global-shape": "do not tile their global shape",
         "dtype": "different dtype",
         "expert": "still DTensors",
+        "size": "different size",
     }.get(case, "cannot materialize")
     assert match in raised, raised
 
 
-@pytest.mark.parametrize("case", ["smaller-mesh", "placement", "global-shape", "dtype", "expert"])
+@pytest.mark.parametrize(
+    "case", ["smaller-mesh", "placement", "global-shape", "dtype", "expert", "size"]
+)
 def test_materialize_owned_refuses_on_every_rank(cpu_dist_workers, case):
     """Every rank refuses, the ranks whose own view looks fine included, instead of waiting in a
     collective the refusing rank never joins."""
@@ -298,22 +305,47 @@ def _materialize_two_ranks_job(rank, world_size):
         "c.weight": torch.randn(2, 5),
         "d.weight": torch.randn(1, 6),  # rank 1's shard is empty
     }
-    sd = {k: distribute_tensor(v, mesh, [Shard(0)]) for k, v in full.items()}
+    # Rank 0 owns the larger and holds all of its rows: it assembles having received nothing, so
+    # what it sent is all it could still be holding.
+    send_only = {"e.weight": torch.randn(1, 60), "f.weight": torch.randn(7, 4)}
+    # The copies this rank sends, and how many of them are still held at each assembled store.
+    sent, held = [], []
+    batch_isend_irecv = torch.distributed.batch_isend_irecv
 
-    with bounded_collectives():
-        _materialize_owned(sd, set(), rank, world_size)
+    def recording_sends(ops):
+        isends = [op for op in ops if op.op is torch.distributed.isend]
+        sent.extend(StorageWeakRef(op.tensor.untyped_storage()) for op in isends)
+        return batch_isend_irecv(ops)
 
-    for k, v in sd.items():
-        assert not isinstance(v, DTensor), k
-        assert torch.equal(v, full[k]), k
-    owned: list = [None] * world_size
-    torch.distributed.all_gather_object(owned, sorted(sd))
-    assert sorted(k for keys in owned for k in keys) == sorted(full)
+    class CountingHeldSends(dict):
+        def __setitem__(self, key, value):
+            held.append(sum(not ref.expired() for ref in sent))
+            super().__setitem__(key, value)
+
+    for layout in (full, send_only):
+        sd = CountingHeldSends(
+            {k: distribute_tensor(v, mesh, [Shard(0)]) for k, v in layout.items()}
+        )
+
+        with (
+            bounded_collectives(),
+            mock.patch.object(torch.distributed, "batch_isend_irecv", recording_sends),
+        ):
+            _materialize_owned(sd, set(), rank, world_size)
+
+        for k, v in sd.items():
+            assert not isinstance(v, DTensor), k
+            assert torch.equal(v, layout[k]), k
+        owned: list = [None] * world_size
+        torch.distributed.all_gather_object(owned, sorted(sd))
+        assert sorted(k for keys in owned for k in keys) == sorted(layout)
+    assert sent and held and not any(held), held
 
 
 def test_materialize_owned_moves_each_shard_to_its_owner_over_two_ranks(cpu_dist_workers):
     """Each key ends whole on exactly one rank, its shards packed per peer and dtype, unpacked at
-    their offsets and joined in rank order, an uneven and an empty shard included."""
+    their offsets and joined in rank order, an uneven and an empty shard included. What a rank
+    sent is freed before it assembles what it owns."""
     cpu_dist_workers.run(_materialize_two_ranks_job)
 
 
@@ -418,6 +450,30 @@ def test_write_even_shards_writes_both_names_of_a_shared_tensor(gloo_world_of_on
     _write_even_shards({"a": shared, "b": shared}, tmp_path, "1MB", 0, 1)
 
     _assert_byte_identical(_load_checkpoint(tmp_path), {"a": shared, "b": shared})
+
+
+def _write_two_ranks_job(rank, world_size, tmp_dir):
+    torch.manual_seed(rank)
+    # Two of these 512-byte tensors fit a file, so rank 0 writes one file and rank 1 two: a file
+    # number off by a rank's count then lands on another rank's file, or past the total.
+    mine = {f"rank{rank}.w{i}": torch.randn(16, 8) for i in range(2 + rank)}
+    everyone: list = [None] * world_size
+    with bounded_collectives():
+        torch.distributed.all_gather_object(everyone, mine)
+        _write_even_shards(dict(mine), tmp_dir, "1100", rank, world_size)
+
+    _assert_byte_identical(
+        _load_checkpoint(tmp_dir), {k: v for m in everyone for k, v in m.items()}
+    )
+
+
+def test_write_even_shards_numbers_two_ranks_files_into_one_checkpoint(cpu_dist_workers, tmp_path):
+    """Each rank's files are numbered after those of the ranks before it, and the index rank 0
+    writes names every rank's tensors."""
+    cpu_dist_workers.run(_write_two_ranks_job, tmp_dir=tmp_path)
+
+    shards = sorted(p.name for p in tmp_path.glob("*.safetensors"))
+    assert shards == [f"model-{i:05d}-of-00003.safetensors" for i in (1, 2, 3)]
 
 
 def _one_rank_fails_job(rank, world_size, tmp_dir, fails):

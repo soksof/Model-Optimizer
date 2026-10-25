@@ -105,6 +105,21 @@ def _is_full_world_shard0(v, world: int, _mesh_memo: dict | None = None) -> bool
     return _mesh_memo[key]
 
 
+def _run_to_completion(ops: list) -> None:
+    """Run the point-to-point ``ops`` and wait for all of them, then empty ``ops``.
+
+    This is what frees the send buffers, copies of everything this rank sends, before the caller
+    assembles what it received. A ``P2POp`` keeps its tensor, and so does its request after the
+    wait: the ops go with the emptied list, and the requests never leave this call.
+    """
+    import torch.distributed as dist
+
+    if ops:
+        for req in dist.batch_isend_irecv(ops):
+            req.wait()
+    ops.clear()
+
+
 def _gather_shard0_to_owners(
     local_sd: dict, keys: list, owner: dict, all_shapes: list, rank: int, world: int
 ) -> None:
@@ -157,13 +172,15 @@ def _gather_shard0_to_owners(
                         recv_groups.setdefault((r, dt), []).append(k)
 
         ops: list = []
-        keepalive: list = []
         pending: list = []
         for peer, dt in sorted(send_groups, key=lambda kd: (kd[0], str(kd[1]))):
             ks = sorted(send_groups[(peer, dt)])
-            buf = torch.cat([local_sd[k].to_local().reshape(-1) for k in ks])
-            keepalive.append(buf)  # must outlive the wait
-            ops.append(dist.P2POp(dist.isend, buf, peer))
+            # Packed straight into its op: no name here then holds the copy past the transfer.
+            ops.append(
+                dist.P2POp(
+                    dist.isend, torch.cat([local_sd[k].to_local().reshape(-1) for k in ks]), peer
+                )
+            )
         for srcr, dt in sorted(recv_groups, key=lambda kd: (kd[0], str(kd[1]))):
             ks = sorted(recv_groups[(srcr, dt)])
             total = sum(_numel(all_shapes[srcr][k]) for k in ks)
@@ -171,10 +188,7 @@ def _gather_shard0_to_owners(
             pending.append((srcr, ks, buf))
             ops.append(dist.P2POp(dist.irecv, buf, srcr))
 
-        if ops:
-            for req in dist.batch_isend_irecv(ops):
-                req.wait()
-        keepalive.clear()  # the sends are done: free their buffers before assembling
+        _run_to_completion(ops)
 
         # Unpack each peer's flat buffer back into per-key views, in the same order it was packed.
         parts_by_key: dict = {}
@@ -214,8 +228,10 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
 
     This is the step that lets the reverse conversion run: afterwards nothing is a DTensor and no
     tensor is partial, so transformers' conversion ops see the whole tensors they were written for.
-    It is NOT a gather to a single rank: at its peak a rank holds its own shards plus its owned set
-    about twice over (the shards it received and the tensors assembled from them), not the model.
+    It is NOT a gather to a single rank: on top of its own shards, a rank holds copies of the shards
+    it sends and buffers for those it receives while they travel, then the received shards and the
+    tensors assembled from them (the sent copies are freed by then) -- with balanced owners, at most
+    about twice its owned set, not the model.
     """
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor
@@ -247,10 +263,12 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
 
     # ONE collective for all the metadata: the key list (to catch divergence), this rank's expert
     # byte count (to seed load balancing), its local dim-0 extents (to size receive buffers), its view
-    # of each dim-0 shard's global shape, and the placements it cannot materialize. The first three
-    # were separate all_gather_object round trips, each pickling a ~900-entry payload. Every refusal below
+    # of each dim-0 shard's global shape and dtype, the placements it cannot materialize, its experts
+    # that are still DTensors, and the dense sizes owners are assigned from. The first three were
+    # separate all_gather_object round trips, each pickling a ~900-entry payload. Every refusal below
     # is decided from this gathered data, so it is the same on every rank: a rank that raised alone
     # would leave its peers waiting in a collective it never joins.
+    dense_sizes = {k: _nbytes(local_sd[k]) for k in dense_keys}
     my_meta = (
         dense_keys,
         sum(_nbytes(local_sd[k]) for k in expert_keys),
@@ -259,6 +277,7 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
         [(k, pl, f"mesh.ndim={nd}") for k, pl, nd in unsupported[:3]],
         {k: str(local_sd[k].dtype) for k in shard0},
         [k for k in expert_keys if isinstance(local_sd[k], DTensor)][:3],
+        dense_sizes,
     )
     meta: list = [None] * world
     dist.all_gather_object(meta, my_meta)
@@ -344,8 +363,20 @@ def _materialize_owned(local_sd: dict, expert_key_set: set, rank: int, world: in
             f"returning padded chunks, or the ranks disagree on the global shape); first few: "
             f"{untiled[:2]}"
         )
+    # Every rank assigns the owners below from these sizes, so ranks that disagree on one (a plain
+    # buffer left in another dtype on one rank) would disagree on who keeps which tensor: one could
+    # be dropped everywhere or written twice, or a shard sent to a rank not waiting for it.
+    resized = {
+        r: sorted(k for k in dense_keys if m[7][k] != dense_sizes[k])[:3]
+        for r, m in enumerate(meta)
+        if m[7] != dense_sizes
+    }
+    if resized:
+        raise RuntimeError(
+            f"rank {rank}: dense tensor(s) have a different size on different ranks, so the ranks "
+            f"would not agree on which of them writes each; first few per rank: {resized}"
+        )
 
-    dense_sizes = {k: _nbytes(local_sd[k]) for k in dense_keys}
     # Deterministic on every rank: the sort and the argmin both break ties explicitly.
     loads = list(expert_bytes)
     owner: dict = {}
