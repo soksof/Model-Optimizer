@@ -411,12 +411,14 @@ def test_a_compressed_checkpoint_a_spec_decompresses_as_it_loads_passes(
         "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
     )
     monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
-    stored_as = ("weight_packed", "weight_scale")
+    stored_as = {"weight_packed": torch.int32, "weight_scale": torch.bfloat16}
     expert, attention = "model.layers.1.mlp.experts.0.up_proj", "model.layers.1.self_attn.o_proj"
     for name, compressed in (("experts", [expert]), ("more", [expert, attention])):
-        keys = [f"{module}.{n}" for module in compressed for n in stored_as]
+        stored = {
+            f"{m}.{n}": torch.ones(1, dtype=d) for m in compressed for n, d in stored_as.items()
+        }
         (tmp_path / name).mkdir()
-        save_file({key: torch.ones(1) for key in keys}, str(tmp_path / name / "model.safetensors"))
+        save_file(stored, str(tmp_path / name / "model.safetensors"))
     quantization_config = {"quant_method": "compressed-tensors"}
     text = SimpleNamespace(quantization_config=quantization_config, base_model_ep_plan=_EP_PLAN)
     llm = SimpleNamespace(quantization_config=quantization_config)
@@ -427,7 +429,7 @@ def test_a_compressed_checkpoint_a_spec_decompresses_as_it_loads_passes(
 
     with pytest.raises(NotImplementedError, match="cannot dequantize"):
         load_and_prepare_ep(str(tmp_path / "experts"), plan, hf_config=config)
-    _onfly_decompress._mark(config, stored_as)
+    _onfly_decompress._mark(config, tuple(stored_as))
     with pytest.raises(NotImplementedError, match="1 of them outside the experts"):
         load_and_prepare_ep(str(tmp_path / "more"), plan, hf_config=config)
     assert not loaded

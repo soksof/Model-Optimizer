@@ -20,7 +20,8 @@ expert-parallel PTQ runs on the original compressed checkpoint, with no decompre
 The math is the ``compressed_tensors`` library's, driven by the checkpoint's ``quantization_config``:
 ``compressor.compression_param_names(scheme)`` names the stored keys of one weight, and
 ``compressor.decompress(...)["weight"]`` dequantizes them, so every format the library registers
-works. It needs ``compressed_tensors`` importable and transformers 5.8 or newer (earlier releases'
+works whose stored floating-point tensors bf16 holds exactly (:func:`check_compressed_keys`). It
+needs ``compressed_tensors`` importable and transformers 5.8 or newer (earlier releases'
 ``Concatenate`` looks up the sibling keys the decompression consumed).
 
 :func:`install_onfly_decompress` rewrites the per-expert converters ``get_model_conversion_mapping``
@@ -28,6 +29,8 @@ returns, for the model built from the config it marks: each ``.weight`` source b
 keys, and a ``DecompressExperts`` op ahead of the merge dequantizes each expert.
 :func:`to_native_backbone_config` builds a VLM's transformers-native backbone config.
 """
+
+import os
 
 import torch
 
@@ -70,13 +73,25 @@ def to_native_backbone_config(
     return native
 
 
+def _config_levels(hf_config) -> list:
+    """``hf_config`` and the nested language-model configs the expert-parallel load reads."""
+    from modelopt.torch.utils.moe import _SUB_CONFIG_ATTRS
+
+    nested = (getattr(hf_config, attr, None) for attr in _SUB_CONFIG_ATTRS)
+    return [c for c in (hf_config, *nested) if c is not None]
+
+
 def _find_quantization_config(hf_config):
-    """Locate the compressed-tensors ``quantization_config`` (top-level or under ``text_config``) and
-    return it as a plain dict, or ``None`` for a config without one."""
-    qc = getattr(hf_config, "quantization_config", None)
-    if qc is None:
-        tc = getattr(hf_config, "text_config", None)
-        qc = getattr(tc, "quantization_config", None) if tc is not None else None
+    """Locate the compressed-tensors ``quantization_config`` (top-level, else on the nested
+    language-model config) and return it as a plain dict, or ``None`` for a config without one."""
+    qc = next(
+        (
+            found
+            for c in _config_levels(hf_config)
+            if (found := getattr(c, "quantization_config", None)) is not None
+        ),
+        None,
+    )
     if qc is None:
         return None
     if hasattr(qc, "to_dict"):
@@ -189,6 +204,13 @@ def _make_op_class(compressor, scheme, param_names):
                         lists[pn] = sib
                 anchor_list = lists[param_names[0]]
                 present = [pn for pn in param_names if pn in lists]
+                if any(len(lists[pn]) != len(anchor_list) for pn in present):
+                    # Paired by position: an expert short of one would pair every later expert's
+                    # weight with the next one's scale.
+                    counts = ", ".join(f"{len(lists[pn])} {pn}" for pn in present)
+                    raise ValueError(
+                        f"DecompressExperts: {stem} stores {counts}, not one per expert"
+                    )
                 # Non-local experts were sharded away at load (GroupedGemmParallel -> None); decompress
                 # only the local experts this rank owns. Keeps peak memory at the per-rank shard.
                 out[pat] = [
@@ -247,7 +269,12 @@ def _install_keep_int_native():
 
     Without an hf_quantizer the loader casts every source to the target param dtype (bf16); that destroys the integer
     bit pattern of packed weights (`weight_packed`), shapes (`weight_shape`), zero-points and g_idx. Floats (the scale,
-    global scale, dense weights) still cast normally.
+    global scale, dense weights) still cast normally, so the expert-parallel load refuses a checkpoint whose compressed
+    experts store a float bf16 cannot hold exactly (:func:`check_compressed_keys`).
+
+    Process-wide, unlike the converter rewrite: any later load keeps an integer tensor native where it would have cast
+    it to a floating-point dtype. Only a compressed checkpoint loaded without its quantizer asks for that cast: with a
+    quantizer the loader keeps integer tensors as stored, and an unquantized checkpoint stores none for a float param.
     """
     import transformers.core_model_loading as cml
 
@@ -276,9 +303,9 @@ def _mark(hf_config, stored_as):
 
 
 def is_marked(hf_config) -> bool:
-    """Whether :func:`install_onfly_decompress` marked ``hf_config`` (or its ``text_config``) for its hooks."""
-    configs = (hf_config, getattr(hf_config, "text_config", None))
-    return any(getattr(c, _MARK, None) is not None for c in configs if c is not None)
+    """Whether :func:`install_onfly_decompress` marked ``hf_config``, or its nested language-model
+    config, for its hooks."""
+    return any(getattr(c, _MARK, None) is not None for c in _config_levels(hf_config))
 
 
 def install_onfly_decompress(hf_config):
@@ -338,20 +365,28 @@ def install_onfly_decompress(hf_config):
             # Not the compressed checkpoint: rewritten, an uncompressed MoE's experts would match no
             # stored key and load newly initialized without an error.
             return convs
-        # from_pretrained loads from a copy of the marked config; the mark must not reach the config
-        # a later save writes, at either level.
-        for c in (config, getattr(config, "text_config", None)):
-            if hasattr(c, _MARK):
-                delattr(c, _MARK)
-        out = []
+        out, rewritten = [], 0
         for c in convs:
             # only the per-expert MoE converters (have `.weight` sources under `experts`)
             if isinstance(c, WeightConverter) and any(
                 "experts" in p and p.endswith((".weight", ".weight$")) for p in c.source_patterns
             ):
                 out.append(_compressedify(c, compressor, scheme, param_names))
+                rewritten += 1
             else:
                 out.append(c)
+        if not rewritten:
+            # The stock converters would read the experts' plain .weight keys, which the checkpoint
+            # does not store.
+            raise RuntimeError(
+                "install_onfly_decompress: the model's conversion mapping has no per-expert "
+                "converter to rewrite, so its compressed experts would load newly initialized."
+            )
+        # from_pretrained loads from a copy of the marked config; the mark must not reach the config
+        # a later save writes, at any level. Cleared once the experts' converters are rewritten.
+        for c in _config_levels(config):
+            if hasattr(c, _MARK):
+                delattr(c, _MARK)
         return out
 
     setattr(patched, "_onfly_compression", compression)
@@ -363,21 +398,32 @@ def install_onfly_decompress(hf_config):
     )
 
 
-def check_compressed_keys(hf_config, tensor_names) -> None:
-    """Refuse a checkpoint that compresses anything but its experts, or leaves an expert uncompressed.
+def check_compressed_keys(hf_config, ckpt_dir) -> None:
+    """Refuse a checkpoint the decompression would load wrong, by the tensors ``ckpt_dir`` stores.
 
     The hooks rewrite only the experts' converters, and the expert-parallel load drops the
     quantization_config that would load any other compressed weight: a weight compressed outside the
     experts would load newly initialized, and so would an expert stored uncompressed, which the
-    rewritten converters do not read. ``tensor_names`` are the checkpoint's. A weight counts as
-    compressed when it stores a name ``hf_config``'s mark holds other than ``weight``, which an
-    uncompressed weight is stored under too.
+    rewritten converters do not read. A weight counts as compressed when it stores a name
+    ``hf_config``'s mark holds other than ``weight``, which an uncompressed weight is stored under
+    too.
+
+    The load may also cast a compressed weight's floating-point tensors to bf16, the dtype its
+    experts decompress to, before the decompression reads them: one that bf16 cannot hold exactly,
+    such as an fp32 global scale or an fp16 scale, would shift every weight it scales. Only the
+    tensors' names and dtypes are read.
     """
-    configs = (hf_config, getattr(hf_config, "text_config", None))
-    stored_as = next(getattr(c, _MARK) for c in configs if getattr(c, _MARK, None) is not None)
+    from safetensors import safe_open
+
+    from modelopt.torch.utils.plugins.hf_checkpoint_utils import checkpoint_tensor_files
+
+    stored_as = next(
+        getattr(c, _MARK) for c in _config_levels(hf_config) if getattr(c, _MARK, None) is not None
+    )
+    tensor_files = checkpoint_tensor_files(ckpt_dir)
     compressed: set[str] = set()
     expert_weights: set[str] = set()
-    for name in tensor_names:
+    for name in tensor_files:
         stem, _, stored = name.rpartition(".")
         if stored in stored_as and stored != "weight":
             compressed.add(stem)
@@ -391,4 +437,23 @@ def check_compressed_keys(hf_config, tensor_names) -> None:
             f"experts {outside[:1]}, and stores {len(plain)} expert weights uncompressed {plain[:1]}: "
             "on-the-fly decompression loads the experts alone, every one compressed, so the rest "
             "would load newly initialized. Decompress the checkpoint first."
+        )
+    by_file: dict[str, list[str]] = {}
+    for name, file in tensor_files.items():
+        stem, _, stored = name.rpartition(".")
+        if stem in compressed and stored in stored_as:
+            by_file.setdefault(file, []).append(name)
+    inexact: set[str] = set()
+    for file, names in by_file.items():
+        with safe_open(os.path.join(ckpt_dir, file), framework="pt") as f:
+            for name in names:
+                dtype = f.get_slice(name).get_dtype()
+                if dtype in ("F16", "F32", "F64"):
+                    inexact.add(f"{name.rpartition('.')[2]} ({dtype})")
+    if inexact:
+        raise NotImplementedError(
+            f"The checkpoint's compressed experts store {', '.join(sorted(inexact))}, which bf16 "
+            "cannot hold exactly: the load may cast them to bf16, the dtype the experts decompress "
+            "to, before decompressing, shifting every weight they scale. Decompress the checkpoint "
+            "first."
         )

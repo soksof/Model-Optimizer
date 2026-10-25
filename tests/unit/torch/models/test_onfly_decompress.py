@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 transformers = pytest.importorskip("transformers")
 
@@ -180,7 +181,8 @@ def test_packed_experts_decompress_then_fuse_like_an_uncompressed_checkpoint(sto
 def test_only_owned_experts_and_stored_siblings_reach_the_compressor():
     """Under EP the loader hands experts this rank does not own over as ``None``; they are skipped,
     so a rank decompresses only its own. A checkpoint may store fewer params than the scheme
-    declares (no ``weight_global_scale`` in Kimi-K3's mxfp4); missing ones are not passed."""
+    declares (no ``weight_global_scale`` in Kimi-K3's mxfp4); missing ones are not passed, but
+    one stored for some experts and not others is refused."""
     seen = []
 
     class RecordingCompressor(_ScaledCompressor):
@@ -207,6 +209,13 @@ def test_only_owned_experts_and_stored_siblings_reach_the_compressor():
     assert [t.dtype for t in experts] == [torch.bfloat16] * 2
     assert [t[0, 0].item() for t in experts] == [0.5, 1.5]
     assert seen == [(["weight_packed", "weight_scale"], "scheme")] * 2
+    # Paired by position, an expert missing one of them would shift every later expert's pairing.
+    short = {
+        "mlp.experts.*.down_proj.weight_packed$": packed,
+        "mlp.experts.*.down_proj.weight_scale$": [scale, scale],
+    }
+    with pytest.raises(ValueError, match="3 weight_packed, 2 weight_scale, not one per expert"):
+        decompress.convert(short)
 
 
 @pytest.mark.usefixtures("restore_loader_hooks")
@@ -269,6 +278,24 @@ def test_install_rewrites_only_the_per_expert_weight_converters(monkeypatch):
         "mlp.experts.*.gate_proj.weight_packed$",
         "mlp.experts.*.down_proj.weight_packed$",
     ]
+
+
+@pytest.mark.usefixtures("restore_loader_hooks")
+def test_a_marked_model_with_no_expert_converter_to_rewrite_is_refused(monkeypatch):
+    """With nothing rewritten, the stock converters would look for plain ``.weight`` keys the
+    checkpoint does not store, and the experts would load newly initialized. The load is refused,
+    and the config, whose converters were not rewritten, keeps its mark."""
+    renaming = WeightRenaming(r"experts\.(\d+)\.w1\.weight", r"experts.\1.gate_proj.weight")
+    monkeypatch.setattr(mu, "get_model_conversion_mapping", lambda model, **kw: [renaming])
+    compression = (_ScaledCompressor, None, PACKED, "stub-format")
+    monkeypatch.setattr(onfly, "_read_compression", lambda cfg: compression)
+    config = SimpleNamespace()
+    onfly.install_onfly_decompress(config)
+    model = SimpleNamespace(config=copy.deepcopy(config))
+
+    with pytest.raises(RuntimeError, match="no per-expert converter to rewrite"):
+        mu.get_model_conversion_mapping(model)
+    assert onfly.is_marked(model.config)
 
 
 @pytest.mark.usefixtures("restore_loader_hooks")
@@ -417,6 +444,29 @@ def test_a_vlm_marked_at_either_level_loads_through_the_rewritten_converters(
     assert not onfly.is_marked(model.config)
 
 
+@pytest.mark.usefixtures("restore_loader_hooks")
+def test_a_language_model_config_named_llm_config_is_read_as_text_config_is(monkeypatch):
+    """Some VLMs name their language-model config llm_config, which the expert-parallel load reads
+    as it reads text_config: marked there, the VLM loads through the rewritten converters, and the
+    mark is cleared."""
+    monkeypatch.setattr(
+        mu, "get_model_conversion_mapping", lambda model, **kw: list(_stock_expert_converters())
+    )
+    compression = (_ScaledCompressor, None, PACKED, "stub-format")
+    monkeypatch.setattr(onfly, "_read_compression", lambda cfg: compression)
+    llm = SimpleNamespace()
+    onfly.install_onfly_decompress(llm)
+    model = SimpleNamespace(config=SimpleNamespace(llm_config=copy.deepcopy(llm)))
+
+    out = mu.get_model_conversion_mapping(model)
+
+    assert [conv.source_patterns[0] for conv in out] == [
+        "mlp.experts.*.gate_proj.weight_packed$",
+        "mlp.experts.*.down_proj.weight_packed$",
+    ]
+    assert not onfly.is_marked(model.config)
+
+
 # ------------------------------------------------------------------------ reading the checkpoint
 
 
@@ -435,15 +485,20 @@ def test_a_vlm_marked_at_either_level_loads_through_the_rewritten_converters(
             {"at": "text"},
         ),
         (
+            SimpleNamespace(llm_config=SimpleNamespace(quantization_config={"at": "llm"})),
+            {"at": "llm"},
+        ),
+        (
             SimpleNamespace(quantization_config=SimpleNamespace(to_dict=lambda: {"at": "obj"})),
             {"at": "obj"},
         ),
     ],
-    ids=["top-level-first", "text-config", "config-object"],
+    ids=["top-level-first", "text-config", "llm-config", "config-object"],
 )
 def test_the_quantization_config_is_found_at_the_top_level_then_on_the_text_config(config, found):
-    """A VLM may carry its compressed-tensors config at the top level or on ``text_config``, as a
-    config object or a dict; it is always returned as a plain dict."""
+    """A VLM may carry its compressed-tensors config at the top level or on its language-model
+    config (``text_config`` or ``llm_config``), as a config object or a dict; it is always returned
+    as a plain dict."""
     assert onfly._find_quantization_config(config) == found
 
 
@@ -484,6 +539,11 @@ def test_a_config_with_nothing_to_decompress_leaves_the_loader_alone(
 EXPERT = "model.layers.1.mlp.experts.0.gate_proj"
 ATTENTION = "model.layers.1.self_attn.q_proj"
 SHARED_EXPERT = "model.layers.1.mlp.shared_experts.up_proj"  # a dense MLP, not the routed experts
+STORED_DTYPES = {  # as compressed-tensors stores them; every other tensor is bf16 here
+    "weight_packed": torch.int32,
+    "weight_shape": torch.int32,
+    "weight_global_scale": torch.float32,
+}
 
 
 @pytest.mark.parametrize(
@@ -507,6 +567,11 @@ SHARED_EXPERT = "model.layers.1.mlp.shared_experts.up_proj"  # a dense MLP, not 
             "1 expert weights uncompressed",
         ),
         (PACKED, [f"{ATTENTION}.weight", f"{SHARED_EXPERT}.weight"], "compresses 0 weights"),
+        (
+            (*PACKED, "weight_global_scale"),
+            [f"{EXPERT}.{n}" for n in (*PACKED, "weight_global_scale")],
+            r"store weight_global_scale \(F32\), which bf16 cannot hold exactly",
+        ),
     ],
     ids=[
         "experts-alone",
@@ -515,20 +580,27 @@ SHARED_EXPERT = "model.layers.1.mlp.shared_experts.up_proj"  # a dense MLP, not 
         "all-but-the-experts",
         "an-expert-left-uncompressed",
         "nothing-compressed",
+        "an-fp32-scale",
     ],
 )
-def test_a_checkpoint_must_compress_its_experts_and_nothing_else(stored_as, names, match):
+def test_a_checkpoint_must_compress_its_experts_and_nothing_else(tmp_path, stored_as, names, match):
     """The config cannot say which modules a class target such as Linear compressed, so the names
     the checkpoint stores decide: anything else compressed, or an expert stored uncompressed, would
-    load newly initialized, without a quantizer to load it or a converter that reads it."""
+    load newly initialized, without a quantizer to load it or a converter that reads it. A float
+    stored for the experts must be one bf16 holds exactly: the load may cast it to bf16 first."""
+    tensors = {
+        name: torch.zeros(1, dtype=STORED_DTYPES.get(name.rpartition(".")[2], torch.bfloat16))
+        for name in names
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
     config = SimpleNamespace(text_config=SimpleNamespace())
     onfly._mark(config.text_config, stored_as)
 
     if match is None:
-        onfly.check_compressed_keys(config, names)
+        onfly.check_compressed_keys(config, tmp_path)
     else:
         with pytest.raises(NotImplementedError, match=match):
-            onfly.check_compressed_keys(config, names)
+            onfly.check_compressed_keys(config, tmp_path)
 
 
 class _RemoteTextConfig(PretrainedConfig):
