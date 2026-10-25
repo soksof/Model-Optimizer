@@ -535,6 +535,17 @@ def test_a_model_that_cannot_be_built_on_meta_names_itself(run_as, serve, monkey
         resolve_distribution_plan(str(tmp_path))
 
 
+def test_the_config_returned_with_the_plan_is_as_every_rank_read_it(run_as, serve, tmp_path):
+    """Rank 0 alone decides, building the model, which writes to the config it builds from; a
+    sharded load builds from the config returned, so rank 0's must be the one the others read."""
+    run_as(2)
+    serve(LlamaConfig(**_TINY))
+
+    _, hf_config = resolve_distribution_plan(str(tmp_path))
+
+    assert vars(hf_config) == vars(LlamaConfig(**_TINY))
+
+
 def test_the_hub_options_locate_the_checkpoint_the_load_reads(tmp_path):
     """``revision``, ``cache_dir``, ``local_files_only`` and ``subfolder`` find the checkpoint as
     ``load_pretrained`` takes them, so the plan and its config are those of what the load reads."""
