@@ -113,7 +113,9 @@ def test_a_block_fp8_checkpoints_dense_part_is_not_sharded(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
-    config = SimpleNamespace(quantization_config={"quant_method": "fp8"})
+    config = SimpleNamespace(
+        quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]}
+    )
 
     with pytest.raises(NotImplementedError, match="block-fp8 checkpoint cannot be sharded"):
         load_and_prepare_ep("unused", DistributionPlan(2, 2, "fsdp"), hf_config=config)

@@ -1333,7 +1333,7 @@ def _decide_distribution(
         )
     # Why the expert-parallel load cannot shard the dense part, if it cannot: the export cannot write
     # it sharded within several expert-data-parallel replicas, and Distributed Checkpoint, which
-    # loads it sharded, cannot dequantize a block-fp8 checkpoint's F8_E8M0 scales.
+    # loads it sharded, reads a block-fp8 checkpoint's tensors as stored, with no dequantization.
     unshardable, remedy = None, ""
     if ep_size > 1 and world_size // ep_size > 1:
         unshardable = (
@@ -1345,7 +1345,10 @@ def _decide_distribution(
             "MODELOPT_FSDP_SIZE=1 if the dense part fits one GPU."
         )
     elif ep_size > 1 and _ckpt_quant_method(hf_config) == "fp8":
-        unshardable = "from a block-fp8 checkpoint: Distributed Checkpoint cannot dequantize its F8_E8M0 scales"
+        unshardable = (
+            "from a block-fp8 checkpoint: Distributed Checkpoint reads it as stored, with no "
+            "dequantization"
+        )
         remedy = (
             " Set MODELOPT_FSDP_SIZE=1 to replicate it, which dequantizes it as it loads, or start "
             "from an unquantized copy of the model."
@@ -1966,6 +1969,7 @@ def _fsdp2_shard_dense(model: nn.Module, fsdp_mesh, expert_modules) -> int:
 
 # The checkpoint formats load_and_prepare_ep dequantizes as it loads, beside unquantized ones (None).
 # mxfp4 is for experts stored in the standard layout: GPT-OSS's are transposed, which the load refuses.
+# fp8 is block FP8; _ckpt_quant_method calls per-tensor FP8 fp8-per-tensor, which the load refuses.
 _EP_SOURCE_FORMATS = frozenset({None, "fp8", "mxfp4"})
 
 
@@ -1974,14 +1978,22 @@ def _ckpt_quant_method(cfg):
 
     Return the checkpoint's native quantization method (e.g. ``"fp8"`` for block-fp8 DeepSeek-V3),
     or ``None`` if the checkpoint isn't natively quantized. Checks the top config, then a VLM's
-    ``text_config`` or ``llm_config``.
+    ``text_config`` or ``llm_config``. Per-tensor FP8 (AutoFP8's), which names the same method as
+    block FP8 but no ``weight_block_size``, is ``"fp8-per-tensor"``.
     """
     for c in (cfg, getattr(cfg, "text_config", None), getattr(cfg, "llm_config", None)):
         qc = getattr(c, "quantization_config", None)
         m = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
         if m:
             # transformers' config objects carry a QuantizationMethod enum, whose str() is not its value.
-            return str(getattr(m, "value", m))
+            m = str(getattr(m, "value", m))
+            block = (
+                qc.get("weight_block_size")
+                if isinstance(qc, dict)
+                else getattr(qc, "weight_block_size", None)
+            )
+            # transformers reads per-tensor FP8 as 128x128 blocks and loads its weights unscaled.
+            return "fp8-per-tensor" if m == "fp8" and not block else m
     return None
 
 
@@ -2151,7 +2163,7 @@ def load_and_prepare_ep(
     With ``plan.dense == "fsdp"`` the dense part is instead FSDP2-sharded over the ``ep`` group and each
     rank loads only its shard from the checkpoint, never the whole of it -- for a model whose dense part
     does not fit one GPU. A block-fp8 checkpoint cannot be loaded that way: Distributed Checkpoint
-    cannot dequantize its F8_E8M0 scales.
+    reads it as stored, with no dequantization.
 
     EP CANNOT be applied to a meta-init model (transformers' ``GroupedGemmParallel.shard_tensor``
     slices materialized tensors), so this loads real weights via ``from_pretrained`` over the ``ep``
@@ -2216,8 +2228,8 @@ def load_and_prepare_ep(
     quant_method = _ckpt_quant_method(hf_config)
     if plan.is_fsdp_dense and quant_method == "fp8":
         raise NotImplementedError(
-            f"{plan!r}: the dense part of a block-fp8 checkpoint cannot be sharded, since Distributed "
-            "Checkpoint cannot dequantize its F8_E8M0 scales. Plan dense='replicate'."
+            f"{plan!r}: the dense part of a block-fp8 checkpoint cannot be sharded: Distributed "
+            "Checkpoint reads it as stored, with no dequantization. Plan dense='replicate'."
         )
     if quant_method not in _EP_SOURCE_FORMATS:
         # transformers' own quantizer would load it as stored, for PTQ to treat as plain weights.
@@ -2310,6 +2322,8 @@ def load_and_prepare_ep(
     if quant_method == "fp8":
         from transformers import FineGrainedFP8Config
 
+        # transformers keeps the checkpoint's quantization_config, its weight_block_size included,
+        # and takes only the loading attributes (dequantize) from this one.
         from_pretrained_kwargs["quantization_config"] = FineGrainedFP8Config(dequantize=True)
         _patch_finegrained_fp8_dequant(
             dtype

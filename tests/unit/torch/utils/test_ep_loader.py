@@ -104,6 +104,7 @@ def _model_with_decoder_at(prefix):
 # ------------------------------------------------------------------------------- the plan
 
 _EP_PLAN = {"layers.*.mlp.gate": "ep_router", "layers.*.mlp.experts": "moe_tp_experts"}
+_BLOCK_FP8 = {"quant_method": "fp8", "weight_block_size": [128, 128]}  # DeepSeek-V3's format
 
 
 class _Mesh:
@@ -157,8 +158,12 @@ def test_the_loader_refuses_a_plan_for_another_world(gloo_world_of_one):
         load_and_prepare_ep("unused", DistributionPlan(2, ep_size=2))
 
 
-@pytest.mark.parametrize("quant_method", [None, "fp8", "mxfp4"])
-def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch, quant_method):
+@pytest.mark.parametrize(
+    "quantization_config",
+    [None, _BLOCK_FP8, {"quant_method": "mxfp4"}],
+    ids=["unquantized", "block-fp8", "mxfp4"],
+)
+def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch, quantization_config):
     """The export reads the tensors the load could not place back from the checkpoint it records,
     which must be a local directory: a Hub ID there leaves the export nothing to read. The load
     resolves it once the plan and the config pass, before anything reads a weight: a checkpoint
@@ -180,8 +185,8 @@ def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch, quant_metho
     monkeypatch.setattr(model_load_utils, "_resolve_checkpoint_dir", resolve)
 
     config = SimpleNamespace(base_model_ep_plan=_EP_PLAN)
-    if quant_method is not None:
-        config.quantization_config = {"quant_method": quant_method}
+    if quantization_config is not None:
+        config.quantization_config = quantization_config
 
     with pytest.raises(_ResolvedError):
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
@@ -200,6 +205,13 @@ def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch, quant_metho
             )
             for method in ("gptq", "modelopt", "compressed-tensors")
         ),
+        (
+            SimpleNamespace(
+                quantization_config={"quant_method": "fp8", "activation_scheme": "static"}
+            ),
+            NotImplementedError,
+            "cannot dequantize a 'fp8-per-tensor'",
+        ),
         (SimpleNamespace(), ValueError, "declare base_model_ep_plan"),
         (
             SimpleNamespace(base_model_ep_plan={"layers.*.self_attn.q_proj": "colwise"}),
@@ -207,7 +219,14 @@ def test_a_hub_id_is_made_local_before_the_weights_load(monkeypatch, quant_metho
             "styles no routed experts",
         ),
     ],
-    ids=["gptq", "modelopt", "compressed-tensors", "no-ep-plan", "no-routed-experts"],
+    ids=[
+        "gptq",
+        "modelopt",
+        "compressed-tensors",
+        "per-tensor-fp8",
+        "no-ep-plan",
+        "no-routed-experts",
+    ],
 )
 def test_a_config_the_load_cannot_take_is_refused_before_anything_loads(
     ep_world_of_two, config, error, match
@@ -502,20 +521,10 @@ def test_an_expert_parallel_model_without_its_mesh_is_refused():
 @pytest.mark.parametrize(
     ("config", "expected"),
     [
-        (SimpleNamespace(quantization_config={"quant_method": "fp8"}), "fp8"),
+        (SimpleNamespace(quantization_config=_BLOCK_FP8), "fp8"),
         (SimpleNamespace(quantization_config=SimpleNamespace(quant_method="mxfp4")), "mxfp4"),
-        (
-            SimpleNamespace(
-                text_config=SimpleNamespace(quantization_config={"quant_method": "fp8"})
-            ),
-            "fp8",
-        ),
-        (
-            SimpleNamespace(
-                llm_config=SimpleNamespace(quantization_config={"quant_method": "fp8"})
-            ),
-            "fp8",
-        ),
+        (SimpleNamespace(text_config=SimpleNamespace(quantization_config=_BLOCK_FP8)), "fp8"),
+        (SimpleNamespace(llm_config=SimpleNamespace(quantization_config=_BLOCK_FP8)), "fp8"),
         (
             SimpleNamespace(
                 quantization_config={"quant_method": "mxfp4"},
@@ -524,6 +533,12 @@ def test_an_expert_parallel_model_without_its_mesh_is_refused():
             "mxfp4",
         ),
         (SimpleNamespace(quantization_config=FineGrainedFP8Config()), "fp8"),
+        (
+            SimpleNamespace(
+                quantization_config={"quant_method": "fp8", "activation_scheme": "static"}
+            ),
+            "fp8-per-tensor",
+        ),
         (SimpleNamespace(quantization_config={"weight_block_size": [128, 128]}), None),
         (SimpleNamespace(text_config=None), None),
     ],
@@ -534,6 +549,7 @@ def test_an_expert_parallel_model_without_its_mesh_is_refused():
         "vlm-llm-config",
         "top-level-wins",
         "transformers-config-object",
+        "per-tensor-fp8",
         "no-method",
         "unquantized",
     ],
@@ -541,7 +557,8 @@ def test_an_expert_parallel_model_without_its_mesh_is_refused():
 def test_quant_method_comes_from_the_config_or_a_vlms_text_config(config, expected):
     """The top-level config first, else a VLM's text or LLM config. A loaded model's config holds
     transformers' config object, not the JSON dict, and callers compare against ``"fp8"`` /
-    ``"mxfp4"``: it reports the plain method name, not its enum."""
+    ``"mxfp4"``: it reports the plain method name, not its enum. ``"fp8"`` is block FP8 only:
+    per-tensor FP8 names the same method without a block size."""
     assert _ckpt_quant_method(config) == expected
 
 

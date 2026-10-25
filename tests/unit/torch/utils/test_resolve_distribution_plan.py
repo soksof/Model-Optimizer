@@ -451,12 +451,15 @@ def test_what_a_rank_holds_with_the_dense_part_replicated_must_fit(
 
 @needs_qwen3_moe_ep_plan
 @pytest.mark.parametrize(
-    ("num_experts", "quant_method", "ep_size", "match"),
-    [(8, "fp8", 4, "block-fp8"), (2, None, 2, "2 expert-data-parallel replicas")],
+    ("num_experts", "quantization_config", "ep_size", "match"),
+    [
+        (8, {"quant_method": "fp8", "weight_block_size": [128, 128]}, 4, "block-fp8"),
+        (2, None, 2, "2 expert-data-parallel replicas"),
+    ],
     ids=["block-fp8", "several-ep-groups"],
 )
 def test_a_dense_part_the_expert_parallel_load_cannot_shard_is_replicated(
-    run_as, serve, gpu_memory, tmp_path, num_experts, quant_method, ep_size, match
+    run_as, serve, gpu_memory, tmp_path, num_experts, quantization_config, ep_size, match
 ):
     """The expert-parallel load cannot shard the dense part of a block-fp8 checkpoint, which DCP
     cannot dequantize, nor within several EP groups, which the export cannot write. Left to decide,
@@ -464,8 +467,8 @@ def test_a_dense_part_the_expert_parallel_load_cannot_shard_is_replicated(
     replicates it. Without expert parallelism neither rule applies."""
     run_as(4)
     config = _qwen3_moe(num_experts=num_experts)
-    if quant_method:
-        config.quantization_config = {"quant_method": quant_method}
+    if quantization_config:
+        config.quantization_config = quantization_config
     serve(config)
     gpu_memory(1)
 
