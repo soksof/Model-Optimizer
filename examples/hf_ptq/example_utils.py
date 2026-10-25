@@ -107,11 +107,16 @@ def keep_the_experts_implementation(model) -> Iterator[None]:
     if not hasattr(model, "_optimize_model_for_decode"):
         yield
         return
+    # Put back what the model itself held, if anything: a nested use, or a hook bound per instance.
+    own = vars(model).get("_optimize_model_for_decode")
     model._optimize_model_for_decode = nullcontext
     try:
         yield
     finally:
-        del model._optimize_model_for_decode
+        if own is None:
+            del model._optimize_model_for_decode
+        else:
+            model._optimize_model_for_decode = own
 
 
 def run_nemotron_vl_preview(

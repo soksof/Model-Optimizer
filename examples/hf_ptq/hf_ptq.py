@@ -102,6 +102,7 @@ from modelopt.torch.utils.dataset_utils import (
     get_supported_datasets,
 )
 from modelopt.torch.utils.distributed import (
+    _reinstall_a2a_forwards,
     distributed_forward_loop,
     distributed_run,
     distribution_plan,
@@ -370,6 +371,14 @@ def _resolve_distribution(args: argparse.Namespace):
             f"{plan!r}: the TensorRT-LLM checkpoint export (encoder-decoder models, "
             "--sparsity_fmt, int8_smoothquant) runs in a single process; launch hf_ptq without "
             "torchrun for it."
+        )
+    if (plan.is_expert_parallel or plan.is_fsdp_dense) and args.vllm_fakequant_export:
+        # That exporter writes the whole model with save_pretrained from each process it runs in,
+        # and every rank of a sharded model exports: each would write its own part into the same
+        # directory. Rank 0 alone writes a replicated model; --use_fsdp2 refuses it while parsing.
+        raise NotImplementedError(
+            f"{plan!r}: --vllm_fakequant_export writes the whole model from one process, which "
+            "holds only its own part of a sharded model; launch hf_ptq without torchrun for it."
         )
     if plan.world_size > 1 and not args.use_fsdp2 and _recipe_is_auto_quantize(args.recipe):
         # Its search scores each rank's own calibration shard and reduces no score across ranks, so
@@ -650,7 +659,7 @@ def mono_quantize(
             # quantization target; the full forward still exercises that component's quantizers.
             if distribution_plan(full_model).is_expert_parallel:
                 # An expert-parallel run has to calibrate through distributed_forward_loop, not the
-                # plain one: it is the only caller of _reinstall_a2a_forwards, which re-plants the
+                # plain one: it calls _reinstall_a2a_forwards first, which re-plants the
                 # torch_a2a expert/router forward wrappers that quantizer insertion clobbers on
                 # transformers >= 5.16 (where the styles install a forward rather than a pre-hook).
                 # Without it the experts forward runs with process_group=None and raises
@@ -689,6 +698,11 @@ def mono_quantize(
             )
         else:
             language_model = mtq.quantize(language_model, quant_cfg, forward_loop=calibrate_loop)
+        if distribution_plan(full_model).is_expert_parallel:
+            # The calibration loop re-plants the a2a forwards quantizer insertion drops, but a
+            # config without static activation scales calibrates without it, and algorithm None
+            # (the MX formats) never calls it; the preview and the export forward through them.
+            _reinstall_a2a_forwards(full_model, expert_parallel_mesh(full_model))
 
         # For VL models, update full_model to use the quantized language model
         if is_nemotron_vl_model and language_model is not full_model:

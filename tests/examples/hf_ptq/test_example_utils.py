@@ -174,6 +174,20 @@ def test_a_model_without_the_decode_hook_is_previewed_as_it_is():
     assert not hasattr(model, "_optimize_model_for_decode")
 
 
+def test_a_decode_hook_on_the_model_itself_is_put_back_and_previews_nest():
+    """A hook bound on the model instance is restored rather than dropped, and a preview inside
+    another leaves the outer one's stand-in in place."""
+    model = torch.nn.Linear(1, 1)
+    own = model._optimize_model_for_decode = object()
+
+    with example_utils.keep_the_experts_implementation(model):
+        with example_utils.keep_the_experts_implementation(model):
+            pass
+        assert model._optimize_model_for_decode is nullcontext
+
+    assert model._optimize_model_for_decode is own
+
+
 def test_get_original_hf_quant_method_mxfp4_dict():
     # gpt-oss layout: quantization_config is a plain dict carrying quant_method.
     cfg = SimpleNamespace(

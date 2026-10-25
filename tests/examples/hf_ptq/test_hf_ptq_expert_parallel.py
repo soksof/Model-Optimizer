@@ -142,6 +142,7 @@ def _args(dist_state, **overrides):
         low_memory_mode=False,
         use_seq_device_map=False,
         offload_folder=None,
+        vllm_fakequant_export=False,
     )
     vars(args).update(overrides)
     return args
@@ -295,6 +296,32 @@ def test_the_single_process_load_options_are_refused_on_the_routes_this_script_a
         (name,) = option
         with pytest.raises(NotImplementedError, match=f"--{name}"):
             hf_ptq._resolve_distribution(args)
+
+
+@pytest.mark.parametrize(
+    ("make_config", "world_size", "refused"),
+    [
+        (lambda: _deepseek_v3(n_routed_experts=8), 2, True),
+        (lambda: LlamaConfig(**_TINY), 2, False),
+        (lambda: LlamaConfig(**_TINY), 1, False),
+    ],
+    ids=["expert_parallel", "replicated", "single_process"],
+)
+def test_the_vllm_fakequant_export_is_refused_for_a_sharded_model(
+    hf_ptq, monkeypatch, torchrun, make_config, world_size, refused
+):
+    """That exporter writes the whole model with save_pretrained from each process it runs in, so
+    every rank of an expert-parallel run would write its own experts into the same directory. Such a
+    run refuses it before the load; rank 0 alone writes a replicated model, and a single process
+    exports as before."""
+    _serve(monkeypatch, hf_ptq, make_config())
+    args = _args(torchrun(world_size=world_size), vllm_fakequant_export=True)
+
+    if refused:
+        with pytest.raises(NotImplementedError, match="--vllm_fakequant_export"):
+            hf_ptq._resolve_distribution(args)
+    else:
+        hf_ptq._resolve_distribution(args)
 
 
 # ---------------------------------------------------------------------------------- load_model
@@ -616,6 +643,60 @@ def test_only_an_expert_parallel_run_calibrates_through_the_distributed_forward_
         assert chosen == [(full_model, ep_mesh, vlm_forward)]
     else:
         assert chosen == [(language_model, ep_mesh, None)]
+
+
+@pytest.mark.parametrize(
+    "loop_handed", [False, True], ids=["calibration_free", "loop_never_called"]
+)
+@pytest.mark.parametrize(
+    ("plan", "replanted"),
+    [(DistributionPlan(2, ep_size=2), True), (DistributionPlan(2, dense="fsdp"), False)],
+    ids=["expert_parallel", "fsdp2"],
+)
+def test_an_expert_parallel_run_replants_the_all_to_all_forwards_after_quantizing(
+    hf_ptq, monkeypatch, plan, replanted, loop_handed
+):
+    """The calibration loop re-plants the all-to-all forwards that quantizer insertion drops only
+    when the calibration runs it: a config without static activation scales calibrates without the
+    loop, and algorithm None (the MX formats) never calls the loop it is handed. The preview and the
+    export forward through the experts either way, so an expert-parallel run re-plants them once
+    quantized; without expert parallelism there is nothing to re-plant."""
+    ep_mesh, full_model = object(), torch.nn.Linear(2, 2)
+    set_distribution_plan(full_model, plan)
+    events = []
+    monkeypatch.setattr(hf_ptq, "is_quantized", lambda m: False)
+    monkeypatch.setattr(hf_ptq, "need_calibration", lambda cfg: loop_handed)
+    monkeypatch.setattr(hf_ptq, "expert_parallel_mesh", lambda model: ep_mesh)
+    monkeypatch.setattr(hf_ptq, "distributed_forward_loop", lambda *args, **kwargs: object())
+    monkeypatch.setattr(hf_ptq, "create_forward_loop", lambda **kwargs: object())
+    monkeypatch.setattr(
+        hf_ptq.mtq, "quantize", lambda m, cfg, forward_loop: events.append("quantize") or m
+    )
+    monkeypatch.setattr(
+        hf_ptq,
+        "_reinstall_a2a_forwards",
+        lambda model, mesh: events.append(("replant", model, mesh)),
+    )
+    args = SimpleNamespace(
+        qformat="mxfp8",
+        calib_with_images=False,
+        dist_state=_dist_state(world_size=2),
+        layerwise_export=False,
+        specdec_offline_dataset=None,
+    )
+
+    hf_ptq.mono_quantize(
+        args,
+        {"algorithm": None},
+        full_model,
+        full_model,
+        model_type="qwen3_moe",
+        calibration_only=False,
+        calib_dataloader=object(),
+        is_nemotron_vl_model=False,
+    )
+
+    assert events == ["quantize"] + ([("replant", full_model, ep_mesh)] if replanted else [])
 
 
 class _PreviewModel(torch.nn.Module):
