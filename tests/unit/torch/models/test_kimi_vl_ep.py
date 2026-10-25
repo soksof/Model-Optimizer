@@ -39,7 +39,7 @@ import transformers.dynamic_module_utils as dmu
 import transformers.utils.import_utils as import_utils
 from transformers import DeepseekV3Config, DeepseekV3ForCausalLM, PretrainedConfig
 
-from modelopt.torch.models import _onfly_decompress, get_spec
+from modelopt.torch.models import _onfly_decompress, _remote_code, get_spec
 from modelopt.torch.models.kimi_k25 import ep as kimi_k25
 from modelopt.torch.models.kimi_vl import ep as kimi_vl
 from modelopt.torch.utils.moe import _routed_expert_keys
@@ -84,8 +84,8 @@ def remote(monkeypatch, request):
     """Stand in for the checkpoint's remote code: importing it registers its modeling module
     (Kimi-VL's ``modeling_kimi_vl`` unless a test names another), with the inline per-expert
     ``DeepseekV3ForCausalLM`` and a VLM class whose ``tie_weights`` has the old no-kwarg signature,
-    as both Kimi checkpoints ship it. Also restores the compat symbols and loader hooks prepare
-    installs."""
+    as both Kimi checkpoints ship it. Also restores the compat symbols, loader hooks and kept
+    patches prepare installs."""
     modeling, vlm_name = getattr(
         request, "param", ("modeling_kimi_vl", "KimiVLForConditionalGeneration")
     )
@@ -112,6 +112,8 @@ def remote(monkeypatch, request):
 
     monkeypatch.setattr(dmu, "get_class_from_dynamic_module", import_remote_class)
     monkeypatch.setattr(dmu, "get_cached_module_file", dmu.get_cached_module_file)
+    monkeypatch.setattr(dmu, "get_class_in_module", dmu.get_class_in_module)
+    monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
     return module
 
 
@@ -144,7 +146,8 @@ def test_prepare_rebuilds_the_language_model_config_without_a_decompressor(monke
     assert dmu.get_cached_module_file is not staging
 
 
-@pytest.mark.parametrize(
+# Kimi-K2.5's adapter is Kimi-VL's with on-the-fly decompression added; these hold for both.
+_BOTH_ADAPTERS = pytest.mark.parametrize(
     ("adapter", "remote"),
     [
         (kimi_vl, ("modeling_kimi_vl", "KimiVLForConditionalGeneration")),
@@ -153,6 +156,9 @@ def test_prepare_rebuilds_the_language_model_config_without_a_decompressor(monke
     ids=["vl", "k25"],
     indirect=["remote"],
 )
+
+
+@_BOTH_ADAPTERS
 def test_prepare_with_a_checkpoint_swaps_in_native_deepseek_v3_and_shims_tie_weights(
     monkeypatch, adapter, remote
 ):
@@ -177,29 +183,36 @@ def test_prepare_with_a_checkpoint_swaps_in_native_deepseek_v3_and_shims_tie_wei
     assert remote.tied == [model]
 
 
-# Kimi-K2.5's adapter is Kimi-VL's with on-the-fly decompression added; these hold for both.
-
-
+@_BOTH_ADAPTERS
 @pytest.mark.parametrize(
-    ("swap", "modeling"),
+    ("missing", "match"),
     [
-        (lambda: kimi_vl._patch_kimi_vl_modeling_to_native("/ckpt", False), "modeling_kimi_vl"),
-        (lambda: kimi_k25._patch_kimi_modeling_to_native("/ckpt", True), "modeling_kimi_k25"),
+        ("module", "could not find a loaded modeling_kimi"),
+        ("class", "defines no module-level DeepseekV3ForCausalLM"),
     ],
-    ids=["vl", "k25"],
+    ids=["no-module", "no-class"],
 )
-def test_the_swap_fails_loudly_when_the_remote_modeling_did_not_load(monkeypatch, swap, modeling):
-    """Skipping the swap silently would build the per-expert layout that EP cannot shard."""
-    monkeypatch.setattr(dmu, "get_class_from_dynamic_module", lambda *args, **kwargs: None)
+def test_the_swap_fails_loudly_when_the_remote_modeling_has_nothing_to_swap(
+    monkeypatch, adapter, remote, missing, match
+):
+    """Skipping the swap silently would build the per-expert layout that EP cannot shard: when the
+    remote modeling did not load, or names its language model otherwise (a class renamed, or
+    imported where the VLM class builds it), which is not the swap already done."""
+    if missing == "module":
+        monkeypatch.setattr(dmu, "get_class_from_dynamic_module", lambda *args, **kwargs: None)
+    else:
+        del remote.DeepseekV3ForCausalLM
 
-    with pytest.raises(RuntimeError, match=modeling):
-        swap()
+    with pytest.raises(RuntimeError, match=match):
+        adapter.prepare(_vlm_config(), ckpt_path="/ckpt", trust_remote_code=True)
 
 
 @pytest.mark.parametrize("adapter", [kimi_vl, kimi_k25], ids=["vl", "k25"])
 @pytest.mark.parametrize(
     ("config", "kwargs", "match"),
     [
+        # transformers' own port (Kimi-K2.5's, from 5.13), which the patch never reaches.
+        (PretrainedConfig, {"ckpt_path": "/ckpt", "trust_remote_code": True}, "own port"),
         (SimpleNamespace, {}, "text_config"),
         # Without the checkpoint there is no modeling code to patch, and a half-prepared config
         # would load Kimi's own language model under a plan naming none of its experts.
@@ -208,7 +221,7 @@ def test_the_swap_fails_loudly_when_the_remote_modeling_did_not_load(monkeypatch
         # trust_remote_code, so prepare must refuse before reaching it.
         (_vlm_config, {"ckpt_path": "/ckpt"}, "trust_remote_code=True"),
     ],
-    ids=["no-text-config", "no-checkpoint", "untrusted-checkpoint"],
+    ids=["transformers-port", "no-text-config", "no-checkpoint", "untrusted-checkpoint"],
 )
 def test_prepare_refuses_before_patching_anything(monkeypatch, adapter, config, kwargs, match):
     """Before prepare patches anything process-wide, such as the loader's remote-code staging, or

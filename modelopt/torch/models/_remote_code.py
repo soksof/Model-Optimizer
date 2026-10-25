@@ -107,8 +107,11 @@ def keep_patched(suffix: str, patch: Callable[[ModuleType], bool]) -> list[str]:
         setattr(_resolved, "_modelopt_keep_patched", True)
         dmu.get_class_in_module = _resolved
     patched = []
+    # Remote modules only: transformers' own port of a model can share the module's name, as
+    # transformers.models.kimi_k25.modeling_kimi_k25 does from 5.13.
+    remote = f"{dmu.TRANSFORMERS_DYNAMIC_MODULE_NAME}."
     for name, module in list(sys.modules.items()):
-        if module is not None and name.endswith(suffix):
+        if module is not None and name.startswith(remote) and name.endswith(suffix):
             patch(module)
             patched.append(name)
     return patched

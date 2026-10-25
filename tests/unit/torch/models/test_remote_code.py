@@ -17,7 +17,7 @@
 
 import shutil
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -128,3 +128,19 @@ def test_a_patch_stays_on_a_module_transformers_loads_again(
     finally:
         for name in set(sys.modules) - loaded:
             del sys.modules[name]
+
+
+def test_only_remote_modules_are_patched(monkeypatch):
+    """transformers' own port of a model can share its remote module's name (from 5.13,
+    ``transformers.models.kimi_k25.modeling_kimi_k25``); a patch for the checkpoint's code must
+    leave it alone."""
+    monkeypatch.setattr(dmu, "get_class_in_module", dmu.get_class_in_module)
+    monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
+    remote = ModuleType("transformers_modules.Kimi.0123abcd.modeling_kimi_k25")
+    port = ModuleType("transformers.models.kimi_k25.modeling_kimi_k25")
+    for module in (remote, port):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    seen = []
+
+    assert keep_patched(".modeling_kimi_k25", seen.append) == [remote.__name__]
+    assert seen == [remote]

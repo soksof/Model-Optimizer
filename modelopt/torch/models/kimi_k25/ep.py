@@ -50,12 +50,10 @@ sibling keys it has already consumed. The decompressor couples tightly to
 transformers' still-evolving ``WeightConverter`` conversion-ops API.
 """
 
-from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.moe import apply_distributed_support
 
-from .. import _onfly_decompress
-from .._remote_code import keep_patched, stage_full_remote_closure
-from ..kimi_vl.ep import _drop_tie_weights_kwargs, _install_compat_import_shims
+from .. import _kimi, _onfly_decompress
+from .._remote_code import stage_full_remote_closure
 
 
 def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool = False, **_):
@@ -65,27 +63,7 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     DeepseekV3ForCausalLM + apply the EP plan + install the on-the-fly decompressor for
     compressed-tensors experts.
     """
-    if type(hf_config).__module__.startswith("transformers."):
-        # From 5.13, a load without trust_remote_code builds transformers' own port, which the
-        # patch below never reaches.
-        raise ValueError(
-            "kimi_k25: expert parallelism runs on the checkpoint's own modeling code; "
-            "load it with trust_remote_code=True."
-        )
-    if not hasattr(hf_config, "text_config"):
-        raise ValueError("kimi_k25.apply: hf_config has no .text_config (expected a VLM config)")
-    if ckpt_path is None:
-        raise ValueError(
-            "kimi_k25: expert parallelism patches the checkpoint's own modeling code, so it needs "
-            "the checkpoint's path (apply_distributed_support's ckpt_path)."
-        )
-    if not trust_remote_code:
-        # Patching below imports the checkpoint's own modeling code, and transformers'
-        # get_class_from_dynamic_module runs it without checking trust_remote_code itself.
-        raise ValueError(
-            "kimi_k25: expert parallelism imports the checkpoint's own modeling code; "
-            "load it with trust_remote_code=True."
-        )
+    ckpt_path = _kimi.checkpoint_to_patch("kimi_k25", hf_config, ckpt_path, trust_remote_code)
 
     # 1. Install on-the-fly compressed-tensors expert decompressor. Operates on transformers-native
     #    deepseek_v3's per-expert WeightConverter (which fuses per-expert .weight tensors into the
@@ -101,7 +79,7 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     # transformers stages only 1-hop relative imports; Kimi's remote code is 2 hops deep. Install the
     # full-closure staging shim BEFORE any remote-code load (this plugin's get_class_from_dynamic_module
     # below, and from_pretrained later in load_and_prepare_ep).
-    _install_compat_import_shims()
+    _kimi.install_compat_import_shims()
     stage_full_remote_closure()
 
     # 2. Replace text_config with a transformers-native DeepseekV3Config built from the same fields.
@@ -118,49 +96,11 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
 
     # 4. Force-load Kimi's modeling_kimi_k25 module (so we can patch its DeepseekV3ForCausalLM
     #    symbol) and swap to the native class.
-    _patch_kimi_modeling_to_native(ckpt_path, trust_remote_code)
-    return hf_config
-
-
-def _patch_kimi_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -> None:
-    """Point the remote module's ``DeepseekV3ForCausalLM`` at the transformers-native class.
-
-    Load Kimi's remote-code ``modeling_kimi_k25`` module and replace its ``DeepseekV3ForCausalLM``
-    symbol with the transformers-native class. After this, ``KimiK25ForConditionalGeneration.__init__``
-    builds the EP-capable native deepseek_v3 instead of Kimi's per-expert Linears version.
-    """
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
-    from transformers.models.deepseek_v3 import DeepseekV3ForCausalLM as NativeDeepseekV3ForCausalLM
-
-    # Force the dynamic-module loader to stage + import modeling_kimi_k25 into sys.modules.
-    get_class_from_dynamic_module(
-        "modeling_kimi_k25.KimiK25ForConditionalGeneration",
+    _kimi.patch_language_model_to_native(
+        "kimi_k25",
+        "modeling_kimi_k25",
+        "KimiK25ForConditionalGeneration",
         ckpt_path,
-        trust_remote_code=trust_remote_code,
+        trust_remote_code,
     )
-
-    def to_native(module):
-        current = getattr(module, "DeepseekV3ForCausalLM", NativeDeepseekV3ForCausalLM)
-        if current is NativeDeepseekV3ForCausalLM:
-            return False
-        module.DeepseekV3ForCausalLM = NativeDeepseekV3ForCausalLM
-        # Like Kimi-VL's: the remote tie_weights() takes no kwargs, but transformers' post_init and
-        # load call tie_weights(recompute_mapping=False) -> TypeError.
-        kimi_cls = getattr(module, "KimiK25ForConditionalGeneration", None)
-        if kimi_cls is not None:
-            own_tie = vars(kimi_cls).get("tie_weights")
-            if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
-                kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
-        return True
-
-    # The dynamic-module loader names the module like
-    # ``transformers_modules.<short-repo>.<hash>.modeling_kimi_k25``. It stays patched when
-    # from_pretrained resolves the class again, even from a re-executed module.
-    patched = keep_patched(".modeling_kimi_k25", to_native)
-    if not patched:
-        raise RuntimeError(
-            "kimi_k25: could not find a loaded modeling_kimi_k25 in sys.modules to monkey-patch"
-        )
-    print_rank_0(
-        f"[kimi_k25] monkey-patched DeepseekV3ForCausalLM -> transformers-native in: {patched}"
-    )
+    return hf_config

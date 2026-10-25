@@ -40,7 +40,7 @@ if Version(transformers.__version__) < Version("5.8"):
 import transformers.dynamic_module_utils as dmu
 from transformers import DeepseekV3Config, DeepseekV3ForCausalLM, PretrainedConfig
 
-from modelopt.torch.models import _onfly_decompress, get_spec
+from modelopt.torch.models import _kimi, _onfly_decompress, _remote_code, get_spec
 from modelopt.torch.models.kimi_k25 import ep as kimi_k25
 from modelopt.torch.utils.moe import _routed_expert_keys, check_distributed_support
 
@@ -70,7 +70,9 @@ def _vlm_config():
 @pytest.fixture
 def remote(monkeypatch):
     """Stand in for the checkpoint's remote code: importing it registers ``modeling_kimi_k25``,
-    whose ``DeepseekV3ForCausalLM`` is the per-expert remote language model."""
+    whose ``DeepseekV3ForCausalLM`` is the per-expert remote language model. Also restores the
+    loader hooks and kept patches prepare installs, and leaves out its compat import shims, which
+    the Kimi-VL tests cover for both adapters."""
     module = types.ModuleType(f"{REMOTE}.modeling_kimi_k25")
     module.DeepseekV3ForCausalLM = type("DeepseekV3ForCausalLM", (), {})
     module.loads = []
@@ -81,6 +83,9 @@ def remote(monkeypatch):
 
     monkeypatch.setattr(dmu, "get_class_from_dynamic_module", import_remote_class)
     monkeypatch.setattr(dmu, "get_cached_module_file", dmu.get_cached_module_file)
+    monkeypatch.setattr(dmu, "get_class_in_module", dmu.get_class_in_module)
+    monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
+    monkeypatch.setattr(_kimi, "install_compat_import_shims", lambda: None)
     return module
 
 

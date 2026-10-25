@@ -43,47 +43,10 @@ Version: no floor beyond the EP framework's 5.6; validated on transformers 5.9.0
 stand in for the symbols the remote code imports that later releases dropped.
 """
 
-from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.moe import apply_distributed_support
 
-from .. import _onfly_decompress
-from .._remote_code import keep_patched, stage_full_remote_closure
-
-
-def _install_compat_import_shims():
-    """Add stubs for symbols ``modeling_kimi_vl`` imports that newer transformers removed, so the module imports.
-
-    Each guards a torch.fx / legacy-attn-mask code path the native LM + MoonViT forward never hit, so a benign stub is
-    safe. Idempotent (only sets missing attrs).
-    """
-    try:
-        import transformers.utils.import_utils as iu
-
-        if not hasattr(iu, "is_torch_fx_available"):
-            iu.is_torch_fx_available = lambda: False
-    except Exception as e:
-        print_rank_0(f"[kimi] compat-shim warning (import_utils): {type(e).__name__}: {e}")
-    try:
-        import transformers.pytorch_utils as pu
-
-        if not hasattr(pu, "is_torch_greater_or_equal_than_1_13"):
-            pu.is_torch_greater_or_equal_than_1_13 = True
-    except Exception as e:
-        print_rank_0(f"[kimi] compat-shim warning (pytorch_utils): {type(e).__name__}: {e}")
-    try:
-        import transformers.modeling_attn_mask_utils as amu
-
-        if not hasattr(amu, "_prepare_4d_causal_attention_mask"):
-
-            def _prepare_4d_causal_attention_mask(*args, **kwargs):  # pragma: no cover
-                raise RuntimeError(
-                    "kimi: remote _prepare_4d_causal_attention_mask stub called -- the native LM "
-                    "builds its own mask, so this path should be unreachable."
-                )
-
-            amu._prepare_4d_causal_attention_mask = _prepare_4d_causal_attention_mask
-    except Exception as e:
-        print_rank_0(f"[kimi] compat-shim warning (attn_mask_utils): {type(e).__name__}: {e}")
+from .. import _kimi, _onfly_decompress
+from .._remote_code import stage_full_remote_closure
 
 
 def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool = False, **_):
@@ -93,22 +56,9 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     build the native EP-capable DeepseekV3ForCausalLM for the language sub-model. No decompressor: the
     Kimi-VL checkpoint is plain bf16.
     """
-    if not hasattr(hf_config, "text_config"):
-        raise ValueError("kimi_vl.apply: hf_config has no .text_config (expected a VLM config)")
-    if ckpt_path is None:
-        raise ValueError(
-            "kimi_vl: expert parallelism patches the checkpoint's own modeling code, so it needs "
-            "the checkpoint's path (apply_distributed_support's ckpt_path)."
-        )
-    if not trust_remote_code:
-        # Patching below imports the checkpoint's own modeling code, and transformers'
-        # get_class_from_dynamic_module runs it without checking trust_remote_code itself.
-        raise ValueError(
-            "kimi_vl: expert parallelism imports the checkpoint's own modeling code; "
-            "load it with trust_remote_code=True."
-        )
+    ckpt_path = _kimi.checkpoint_to_patch("kimi_vl", hf_config, ckpt_path, trust_remote_code)
 
-    _install_compat_import_shims()
+    _kimi.install_compat_import_shims()
     stage_full_remote_closure()
 
     # Native deepseek_v3 config for the LM (drops the remote auto_map so the native class is used).
@@ -116,63 +66,11 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     # EP plan onto the native text_config (bubbles up to the VLM root under language_model.*).
     apply_distributed_support("deepseek_v3", hf_config.text_config)
 
-    _patch_kimi_vl_modeling_to_native(ckpt_path, trust_remote_code)
-    return hf_config
-
-
-def _drop_tie_weights_kwargs(orig_tie):
-    """Wrap a remote ``tie_weights()`` that predates the kwargs newer transformers pass to it.
-
-    Dropping ``missing_keys`` as well as ``recompute_mapping`` is safe because the remote
-    ``tie_weights`` only calls its language model's, and the Kimi checkpoints set
-    ``tie_word_embeddings=False``: nothing is tied, so no tied key is left to report to the load.
-    """
-
-    def _tie_weights(self, *args, **kwargs):  # drop recompute_mapping etc.
-        return orig_tie(self)
-
-    setattr(_tie_weights, "_kimi_vl_kwargs_shim", True)
-    return _tie_weights
-
-
-def _patch_kimi_vl_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -> None:
-    """Point the remote module's inline ``DeepseekV3ForCausalLM`` at the native class.
-
-    Load Kimi-VL's remote ``modeling_kimi_vl`` and replace its inline ``DeepseekV3ForCausalLM`` with
-    the transformers-native class, so ``KimiVLForConditionalGeneration.__init__`` builds the EP-capable
-    native deepseek_v3 for ``self.language_model`` (MoonViT + wrapper stay from the bundled code).
-    """
-    from transformers.dynamic_module_utils import get_class_from_dynamic_module
-    from transformers.models.deepseek_v3 import DeepseekV3ForCausalLM as NativeDeepseekV3ForCausalLM
-
-    get_class_from_dynamic_module(
-        "modeling_kimi_vl.KimiVLForConditionalGeneration",
+    _kimi.patch_language_model_to_native(
+        "kimi_vl",
+        "modeling_kimi_vl",
+        "KimiVLForConditionalGeneration",
         ckpt_path,
-        trust_remote_code=trust_remote_code,
+        trust_remote_code,
     )
-
-    def to_native(module):
-        current = getattr(module, "DeepseekV3ForCausalLM", NativeDeepseekV3ForCausalLM)
-        if current is NativeDeepseekV3ForCausalLM:
-            return False
-        module.DeepseekV3ForCausalLM = NativeDeepseekV3ForCausalLM
-        # transformers 5.9's init_weights calls self.tie_weights(recompute_mapping=False), but
-        # Kimi-VL's remote tie_weights() has the older no-kwarg signature -> TypeError. Wrap it to
-        # swallow the extra kwargs (it only ties the LM head/embeddings; the kwargs don't apply).
-        kimi_cls = getattr(module, "KimiVLForConditionalGeneration", None)
-        if kimi_cls is not None:
-            own_tie = vars(kimi_cls).get("tie_weights")
-            if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
-                kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
-        return True
-
-    # Kept patched when from_pretrained resolves the class again, even from a re-executed module.
-    patched = keep_patched(".modeling_kimi_vl", to_native)
-    if not patched:
-        raise RuntimeError(
-            "kimi_vl: could not find a loaded modeling_kimi_vl in sys.modules to monkey-patch"
-        )
-    print_rank_0(
-        f"[kimi_vl] monkey-patched DeepseekV3ForCausalLM -> transformers-native (+tie_weights shim) in: "
-        f"{patched}"
-    )
+    return hf_config
