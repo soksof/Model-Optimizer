@@ -102,21 +102,23 @@ def keep_the_experts_implementation(model) -> Iterator[None]:
     ``torch_a2a`` forwards, which ``batched_mm`` bypasses, so the preview after PTQ would decode on
     unquantized experts. And Transformers refuses the switch for an FSDP2-wrapped model, whose class
     is a subclass built outside its modeling module: ``FSDPQwen3MoeForCausalLM does not support
-    setting experts implementation``. A model without the hook is left alone.
+    setting experts implementation``. Every module of the model that has the hook is kept from it:
+    a model can generate through a submodule, as a Nemotron-VL model's ``chat`` generates through
+    its language model.
     """
-    if not hasattr(model, "_optimize_model_for_decode"):
-        yield
-        return
-    # Put back what the model itself held, if anything: a nested use, or a hook bound per instance.
-    own = vars(model).get("_optimize_model_for_decode")
-    model._optimize_model_for_decode = nullcontext
+    modules = [m for m in model.modules() if hasattr(m, "_optimize_model_for_decode")]
+    # Put back what each module itself held, if anything: a nested use, or a hook bound per instance.
+    own = [(module, vars(module).get("_optimize_model_for_decode")) for module in modules]
+    for module in modules:
+        module._optimize_model_for_decode = nullcontext
     try:
         yield
     finally:
-        if own is None:
-            del model._optimize_model_for_decode
-        else:
-            model._optimize_model_for_decode = own
+        for module, held in own:
+            if held is None:
+                del module._optimize_model_for_decode
+            else:
+                module._optimize_model_for_decode = held
 
 
 def run_nemotron_vl_preview(

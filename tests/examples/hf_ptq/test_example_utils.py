@@ -138,12 +138,14 @@ def test_build_quant_cfg_sets_moe_calib_experts_ratio_on_every_algorithm(algorit
     assert quant_cfg["algorithm"] == expected
 
 
-def test_a_preview_keeps_generate_from_switching_the_experts_implementation(monkeypatch):
+@pytest.mark.parametrize("wrapped", [False, True], ids=["the-model", "a-model-around-it"])
+def test_a_preview_keeps_generate_from_switching_the_experts_implementation(monkeypatch, wrapped):
     """On a GPU, ``generate`` switches a ``grouped_mm`` MoE's experts to ``batched_mm`` for decoding,
     which ModelOpt's quantizers do not intercept (the preview after PTQ decodes unquantized experts)
     and which Transformers refuses for an FSDP2-wrapped class (``FSDPQwen3MoeForCausalLM does not
     support setting experts implementation``). The hook ``generate`` enters is out of the way for the
-    preview, and back after it."""
+    preview, and back after it, also when the previewed model generates through a submodule, as a
+    Nemotron-VL model's ``chat`` generates through its language model."""
     entered = []
 
     @contextmanager
@@ -154,12 +156,14 @@ def test_a_preview_keeps_generate_from_switching_the_experts_implementation(monk
 
     monkeypatch.setattr(GenerationMixin, "_optimize_model_for_decode", switch)
     model = get_tiny_llama()
+    # The model around it has no hook of its own; the preview generates through the inner one.
+    previewed = torch.nn.ModuleDict({"language_model": model}) if wrapped else model
     input_ids = torch.tensor([[1, 2, 3]])
 
     # Some releases enter the hook only for the decode steps after the first token.
     with pytest.raises(ValueError, match="does not support setting experts implementation"):
         model.generate(input_ids, max_new_tokens=3)
-    with example_utils.keep_the_experts_implementation(model):
+    with example_utils.keep_the_experts_implementation(previewed):
         model.generate(input_ids, max_new_tokens=3)
 
     assert entered == ["LlamaForCausalLM"]  # only the first, unprotected call reached the hook

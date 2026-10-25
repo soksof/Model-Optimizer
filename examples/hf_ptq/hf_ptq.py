@@ -1008,7 +1008,9 @@ def post_quantize(
             if distribution_plan(full_model).is_expert_parallel:
                 # The ranks decode in lockstep: a rank that skipped the preview would leave the
                 # others blocked in the next step's collective, so the run stops. --use_fsdp2 keeps
-                # main's skip, which still exports after a failure every rank meets at the same step.
+                # main's skip, which still exports after a failure every rank meets at the same step;
+                # a failure on one rank alone, such as an out-of-memory error, leaves the other ranks
+                # blocked in generate's collectives until the collective timeout.
                 raise RuntimeError(_PREVIEW_STOPS_THE_RUN) from e
             warnings.warn(f"Post-quantization generation sanity check failed, skipping it: {e}")
     elif is_nemotron_vl_model and tokenizer is not None:
