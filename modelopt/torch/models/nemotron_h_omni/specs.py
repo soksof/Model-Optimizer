@@ -38,11 +38,12 @@ register(
         model_type="nemotron_h_omni",
         # transformers ships the Omni VLM itself from 5.18. The checkpoint's own code
         # (``trust_remote_code=True``) names the language-model config ``llm_config``, and
-        # transformers' port ``text_config``: the plan goes on whichever the config has.
+        # transformers' port ``text_config``: the plan goes on whichever the config has, tried in
+        # the order the load reads them.
         min_transformers_version="5.18",
         ep_spec=EPSpec(
             base_model_ep_plan=BASE_MODEL_EP_PLAN,
-            plan_config_attr=("llm_config", "text_config"),
+            plan_config_attr=("text_config", "llm_config"),
         ),
     )
 )

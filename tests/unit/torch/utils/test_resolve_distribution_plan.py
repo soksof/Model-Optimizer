@@ -534,7 +534,8 @@ def test_the_plan_a_spec_would_supply(monkeypatch):
     """What that guard reads at an EP degree of 1: the spec's plan, or the plan it states its
     ``prepare`` attaches, read without running ``prepare``; nothing for a model with no spec or no
     expert-parallel section, and nothing for a spec that refuses expert parallelism even when it
-    names a plan."""
+    names a plan. A model below its spec's transformers floor keeps its plan: its experts are no
+    less routed, and whole on every rank they are refused like any other's."""
     assert moe._spec_ep_plan("deepseek_v3") == get_spec("deepseek_v3").ep_spec.base_model_ep_plan
     assert moe._spec_ep_plan("llama") == {}
     assert moe._spec_ep_plan("no_such_model_type") == {}
@@ -548,10 +549,15 @@ def test_the_plan_a_spec_would_supply(monkeypatch):
         "refusing": SimpleNamespace(
             ep_spec=SimpleNamespace(unsupported="not yet", base_model_ep_plan={"layers.*.mlp": "x"})
         ),
+        "below_its_floor": SimpleNamespace(
+            ep_spec=EPSpec(base_model_ep_plan=prepared, requires_transformers="999")
+        ),
     }
     monkeypatch.setattr(models, "get_spec", specs.get)
     assert moe._spec_ep_plan("preparing") == prepared
     assert moe._spec_ep_plan("refusing") == {}
+    assert moe._spec_refuses_ep("below_its_floor")
+    assert moe._spec_ep_plan("below_its_floor") == prepared
 
 
 def test_an_ep_capable_moe_may_be_fsdp2_sharded_instead(run_as, serve, monkeypatch, tmp_path):

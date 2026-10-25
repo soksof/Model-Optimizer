@@ -216,22 +216,21 @@ def apply_distributed_support(
     if ep is None:
         return hf_config
 
+    # The spellings of the config the plan goes on; the first this config has takes it. Checked for
+    # every spec, before anything is attached or prepared, whatever supplies the plan.
+    attrs = ep.plan_config_attr or ()
+    if isinstance(attrs, str):
+        attrs = (attrs,)
+    unread = [attr for attr in attrs if attr not in _SUB_CONFIG_ATTRS]
+    if unread:
+        raise ValueError(
+            f"{model_type}'s spec attaches its expert-parallel plan to "
+            f"config.{' or config.'.join(unread)}, where the expert-parallel load does not read "
+            f"one; it reads config.{' and config.'.join(_SUB_CONFIG_ATTRS)}."
+        )
     if ep.base_model_ep_plan:
         target = hf_config
-        if ep.plan_config_attr:
-            # The spellings of the config the plan goes on; the first this config has takes it.
-            attrs = (
-                (ep.plan_config_attr,)
-                if isinstance(ep.plan_config_attr, str)
-                else ep.plan_config_attr
-            )
-            unread = [attr for attr in attrs if attr not in _SUB_CONFIG_ATTRS]
-            if unread:
-                raise ValueError(
-                    f"{model_type}'s spec attaches its expert-parallel plan to "
-                    f"config.{' or config.'.join(unread)}, where the expert-parallel load does not "
-                    f"read one; it reads config.{' and config.'.join(_SUB_CONFIG_ATTRS)}."
-                )
+        if attrs:
             target = next(
                 (sub for attr in attrs if (sub := getattr(hf_config, attr, None)) is not None),
                 None,
@@ -253,8 +252,11 @@ def _spec_ep_plan(model_type: str) -> dict[str, str]:
     """The ``base_model_ep_plan`` :func:`apply_distributed_support` would attach for ``model_type``.
 
     Itself, or through the spec's ``prepare``. Empty for a model type with no spec, no
-    expert-parallel section, or one that refuses expert parallelism. Only reads the spec: nothing
-    is applied, checked or patched, and ``prepare`` does not run.
+    expert-parallel section, or one whose spec refuses expert parallelism outright
+    (``unsupported``). A model below its spec's transformers floor keeps its plan: its experts are
+    routed all the same, so a run holding them whole on every rank is refused rather than
+    replicated. Only reads the spec: nothing is applied, checked or patched, and ``prepare`` does
+    not run.
     """
     ep = _ep_spec(model_type)
     if ep is None or ep.unsupported:

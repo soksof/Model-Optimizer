@@ -65,7 +65,7 @@ def test_the_omni_vlm_reuses_the_text_models_plan():
 
 def test_the_omni_vlm_puts_its_plan_on_the_nested_config():
     """Its experts live in the language sub-model, and the globs are written against that tree."""
-    assert get_spec("nemotron_h_omni").ep_spec.plan_config_attr == ("llm_config", "text_config")
+    assert get_spec("nemotron_h_omni").ep_spec.plan_config_attr == ("text_config", "llm_config")
     assert get_spec("nemotron_h").ep_spec.plan_config_attr is None
 
 
@@ -90,32 +90,41 @@ def test_the_attached_plan_is_a_copy():
     assert "injected" not in get_spec("deepseek_v3").ep_spec.base_model_ep_plan
 
 
-@pytest.mark.parametrize("attr", ["llm_config", "text_config"])
-def test_a_vlm_plan_lands_on_the_nested_config_only(attr):
+@pytest.mark.parametrize(
+    "attrs", [("llm_config",), ("text_config",), ("text_config", "llm_config")]
+)
+def test_a_vlm_plan_lands_on_the_nested_config_only(attrs):
     """On the root config the globs match no parameter, and the failure is silence, not an error.
     The Omni checkpoint's own code names that config llm_config, and transformers' port
     text_config: a multi-rank run of either applies the spec, whether it wants experts sharded or
-    not."""
-    config = cfg(**{attr: cfg()})
+    not. A config with both takes it on text_config, which the load reads the expert count from
+    first."""
+    config = cfg(**{attr: cfg() for attr in attrs})
     apply_distributed_support("nemotron_h_omni", config)
-    assert getattr(config, attr).base_model_ep_plan
-    assert not hasattr(config, "base_model_ep_plan")
+    assert getattr(config, attrs[0]).base_model_ep_plan
+    others = [config, *(getattr(config, attr) for attr in attrs[1:])]
+    assert not any(hasattr(other, "base_model_ep_plan") for other in others)
 
 
 def test_a_missing_nested_config_is_an_error_not_a_silent_skip():
-    with pytest.raises(ValueError, match=r"config\.llm_config or config\.text_config"):
+    with pytest.raises(ValueError, match=r"config\.text_config or config\.llm_config"):
         apply_distributed_support("nemotron_h_omni", cfg())
 
 
-def test_a_plan_attached_where_the_load_does_not_read_one_is_an_error(monkeypatch):
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"base_model_ep_plan": {"layers.*.experts": "grouped_gemm"}},
+        {"prepare": lambda *args, **kwargs: pytest.fail("ran prepare")},
+    ],
+    ids=["by-the-spec", "by-prepare"],
+)
+def test_a_plan_attached_where_the_load_does_not_read_one_is_an_error(monkeypatch, supplied):
     """The load reads a VLM's plan off text_config or llm_config: attached anywhere else, it would
-    be read as no plan at all, and the MoE planned as a dense model."""
+    be read as no plan at all, and the MoE planned as a dense model. Refused whichever supplies the
+    plan, the spec or its prepare, before either touches the config."""
     spec = ModelSpec(
-        model_type="_probe",
-        ep_spec=EPSpec(
-            base_model_ep_plan={"layers.*.experts": "grouped_gemm"},
-            plan_config_attr="language_config",
-        ),
+        model_type="_probe", ep_spec=EPSpec(plan_config_attr="language_config", **supplied)
     )
     monkeypatch.setattr(
         "modelopt.torch.models.get_spec", lambda mt: spec if mt == "_probe" else None
