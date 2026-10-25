@@ -769,8 +769,9 @@ def _reinstall_a2a_forwards(model, ep_mesh) -> int:
     rebinds ``module.forward`` on the same instance, dropping the wrapper -- after which
     ``torch_a2a_experts_forward`` receives ``process_group=None`` and raises.
 
-    Called at the top of the calibration loop: after conversion (so it wraps the QUANTIZED forward)
-    and before the first forward. A module whose forward is still the wrapper planted here is
+    Called at the top of the calibration loop, and by ``hf_ptq`` right after quantizing (a recipe
+    with no calibration runs no loop): after conversion (so it wraps the QUANTIZED forward) and
+    before the first forward. A module whose forward is still the wrapper planted here is
     skipped, so repeated calibration passes do not stack wrappers; one whose forward was rebound
     since (another conversion, or an export restoring an earlier forward) is planted again.
     ``ep_mesh`` is the mesh the routed experts are sharded over; without one there is nothing to
