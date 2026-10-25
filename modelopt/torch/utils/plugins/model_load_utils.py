@@ -1302,15 +1302,14 @@ def _dense_from_env(world_size: int) -> str:
 def _ep_degree(ep_size, model_type: str) -> int | str:
     """``ep_size`` as an EP degree or ``"auto"``; ``None`` reads ``MODELOPT_EP_DEGREE``.
 
-    Auto is 1 for a model whose spec refuses expert parallelism: only an EP degree asked for
-    explicitly meets that refusal.
+    Auto is 1 for a model whose spec refuses expert parallelism on the installed transformers, for
+    good or below the release it needs: only an EP degree asked for explicitly meets that refusal.
     """
-    from modelopt.torch.utils.moe import _ep_spec
+    from modelopt.torch.utils.moe import _spec_refuses_ep
 
     value = env.ep_degree() if ep_size is None else ep_size
     if str(value) in ("auto", "0"):
-        ep = _ep_spec(model_type)
-        return 1 if ep is not None and ep.unsupported else "auto"
+        return 1 if _spec_refuses_ep(model_type) else "auto"
     try:
         return int(value)
     except ValueError:
@@ -1484,7 +1483,7 @@ def resolve_distribution_plan(
 
     * ``ep_size``: the expert-parallel degree, or ``"auto"``, the largest that divides both the
       world and the routed-expert count of a model whose config carries a ``base_model_ep_plan``,
-      and 1 for a model whose spec refuses expert parallelism.
+      and 1 for a model whose spec refuses expert parallelism on the installed transformers.
     * ``dense``: ``"replicate"`` or ``"fsdp"`` for the rest of the model, or ``"auto"``, which
       FSDP2-shards it when a whole copy of it and the rank's share of the routed experts would take
       more than 60% of one GPU's memory. That GPU is rank 0's, by its total memory, so ``"auto"``
@@ -1509,8 +1508,8 @@ def resolve_distribution_plan(
     the checkpoint's, which is then not read: each rank takes a copy, as building writes to it.
 
     Unless rank 0's knobs rule expert parallelism out (a single process, or an EP degree of 1,
-    which auto is for a model whose spec refuses expert parallelism), every rank applies the
-    model's spec to a copy of the config first
+    which auto is for a model whose spec refuses expert parallelism on the installed
+    transformers), every rank applies the model's spec to a copy of the config first
     (:func:`~modelopt.torch.utils.moe.apply_distributed_support`): for several models it is what
     supplies the expert-parallel plan, and an expert-parallel plan returns that copy. Any other
     plan returns the config without it, which the export would otherwise write out. A plan that

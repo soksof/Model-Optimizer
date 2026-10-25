@@ -383,7 +383,6 @@ def test_an_ep_capable_moe_is_planned_expert_parallel(run_as, serve, tmp_path, c
     assert ("Distribution:" in capsys.readouterr().out) == (rank == 0)
 
 
-@needs_qwen3_moe_ep_plan  # its spec asks for the release that ships its plan
 def test_an_moe_without_an_ep_plan_is_not_expert_parallel(run_as, serve, tmp_path):
     """The config counts 8 experts, but with no base_model_ep_plan nothing could shard them."""
     run_as(4)
@@ -439,14 +438,38 @@ def test_only_an_expert_parallel_plan_carries_the_spec_plan_on(run_as, serve, tm
     assert hf_config.base_model_ep_plan is None
 
 
-def test_a_run_without_expert_parallelism_needs_no_spec(run_as, serve, monkeypatch, tmp_path):
-    """GPT-OSS cannot be expert-parallel, which its spec says by refusing an EP degree above 1. A run
-    that rules expert parallelism out does not ask its spec, nor does one leaving the EP degree to
-    auto, which picks none for it: asking for FSDP2 alone shards it whole."""
+@pytest.mark.parametrize(
+    ("config", "floor", "error", "refusal"),
+    [
+        pytest.param(
+            GptOssConfig(num_local_experts=4, **_TINY),
+            None,
+            NotImplementedError,
+            "cannot be quantized expert-parallel yet",
+            id="spec-refuses-ep",
+        ),
+        pytest.param(
+            _qwen3_moe(num_experts=4),
+            "99",
+            RuntimeError,
+            "requires transformers >= 99",
+            id="below-the-specs-floor",
+        ),
+    ],
+)
+def test_a_run_without_expert_parallelism_needs_no_spec(
+    run_as, serve, monkeypatch, tmp_path, config, floor, error, refusal
+):
+    """GPT-OSS cannot be expert-parallel, which its spec says by refusing an EP degree above 1, nor
+    can a model on a transformers older than its spec asks for. A run that rules expert parallelism
+    out does not ask the spec, nor does one leaving the EP degree to auto, which picks none for
+    either: asking for FSDP2 alone shards it whole."""
+    if floor is not None:
+        monkeypatch.setattr(get_spec(config.model_type).ep_spec, "requires_transformers", floor)
     run_as(2)
-    serve(GptOssConfig(num_local_experts=4, **_TINY))
+    serve(config)
 
-    with pytest.raises(NotImplementedError, match="cannot be quantized expert-parallel yet"):
+    with pytest.raises(error, match=refusal):
         resolve_distribution_plan(str(tmp_path), ep_size=2)
     plan, _ = resolve_distribution_plan(str(tmp_path), ep_size=1, dense="fsdp")
     assert plan == DistributionPlan(2, dense="fsdp")

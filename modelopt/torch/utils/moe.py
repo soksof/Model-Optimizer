@@ -152,9 +152,9 @@ def check_distributed_support(model_type: str) -> None:
     """Refuse ``model_type``'s expert parallelism if its spec does; enforce its transformers floor.
 
     :func:`apply_distributed_support` checks this before it prepares a config; a config already
-    prepared with its plan needs only the check. A multi-rank run that leaves the EP degree to
-    ``auto`` gets here before its plan is decided, so both errors name the way around expert
-    parallelism.
+    prepared with its plan needs only the check. An EP degree left to ``auto`` picks none for a
+    model this refuses (:func:`_spec_refuses_ep`), so only an EP degree asked for explicitly, or an
+    expert-parallel plan handed in, meets these errors; both name the way around expert parallelism.
     """
     ep = _ep_spec(model_type)
     if ep is None:
@@ -163,7 +163,8 @@ def check_distributed_support(model_type: str) -> None:
     # multimodal checkpoint (GPT-OSS's MXFP4, Llama-4's) needs a single process.
     without_ep = (
         "without expert parallelism: in a single process, or FSDP2-sharded (--use_fsdp2 in "
-        "examples/hf_ptq/hf_ptq.py) if the checkpoint is an unquantized causal LM"
+        "examples/hf_ptq/hf_ptq.py, or MODELOPT_FSDP_SIZE=world) if the checkpoint is an "
+        "unquantized causal LM"
     )
     if ep.unsupported:
         raise NotImplementedError(
@@ -175,6 +176,15 @@ def check_distributed_support(model_type: str) -> None:
             require_transformers(ep.requires_transformers, f"{model_type} expert-parallel PTQ")
         except RuntimeError as e:
             raise RuntimeError(f"{e} Or quantize it {without_ep}.") from None
+
+
+def _spec_refuses_ep(model_type: str) -> bool:
+    """Whether :func:`check_distributed_support` refuses ``model_type``'s expert parallelism here."""
+    try:
+        check_distributed_support(model_type)
+    except RuntimeError:  # NotImplementedError is one too
+        return True
+    return False
 
 
 def apply_distributed_support(
@@ -209,19 +219,27 @@ def apply_distributed_support(
     if ep.base_model_ep_plan:
         target = hf_config
         if ep.plan_config_attr:
-            if ep.plan_config_attr not in _SUB_CONFIG_ATTRS:
+            # The spellings of the config the plan goes on; the first this config has takes it.
+            attrs = (
+                (ep.plan_config_attr,)
+                if isinstance(ep.plan_config_attr, str)
+                else ep.plan_config_attr
+            )
+            unread = [attr for attr in attrs if attr not in _SUB_CONFIG_ATTRS]
+            if unread:
                 raise ValueError(
                     f"{model_type}'s spec attaches its expert-parallel plan to "
-                    f"config.{ep.plan_config_attr}, where the expert-parallel load does not read "
-                    f"one; it reads config.{' and config.'.join(_SUB_CONFIG_ATTRS)}."
+                    f"config.{' or config.'.join(unread)}, where the expert-parallel load does not "
+                    f"read one; it reads config.{' and config.'.join(_SUB_CONFIG_ATTRS)}."
                 )
-            target = getattr(hf_config, ep.plan_config_attr, None)
+            target = next(
+                (sub for attr in attrs if (sub := getattr(hf_config, attr, None)) is not None),
+                None,
+            )
             if target is None:
                 raise ValueError(
                     f"{model_type} expects its expert-parallel plan on "
-                    f"config.{ep.plan_config_attr}, which this config does not have: the "
-                    "checkpoint's own code (trust_remote_code=True) names its sub-model config so, "
-                    "and a config built without it may not."
+                    f"config.{' or config.'.join(attrs)}, which this config does not have."
                 )
         if not getattr(target, "base_model_ep_plan", None):
             target.base_model_ep_plan = dict(ep.base_model_ep_plan)

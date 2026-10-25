@@ -195,10 +195,11 @@ class EPSpec(SpecSection):
     matching the spec. A model can be fully modelled and still not be shardable: qwen3_moe's
     own ``base_model_ep_plan`` lands in 5.7, while the shared EP framework is 5.6."""
 
-    plan_config_attr: str | None = None
+    plan_config_attr: str | tuple[str, ...] | None = None
     """The nested config attribute carrying the expert-parallel plan, for a VLM whose MoE is
     its text sub-model: ``"text_config"`` or ``"llm_config"``, the two the expert-parallel load
-    reads a plan from. ``None`` means the root config.
+    reads a plan from, or both for a model whose configs spell it either way, the first one a
+    config has taking the plan. ``None`` means the root config.
 
     The plan has to sit on whichever config describes the module tree the globs are written
     against, so a plan on the wrong config silently matches nothing."""

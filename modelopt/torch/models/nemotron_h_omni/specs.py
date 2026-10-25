@@ -17,10 +17,10 @@
 """NemotronH-Omni specs (HF model type ``nemotron_h_omni``).
 
 The Omni VLM's language sub-model is a native NemotronH, so its MoE facts are NemotronH's.
-What differs is where the expert-parallel plan has to be attached: on the nested ``llm_config``,
-not the VLM root. transformers aggregates each sub-model's plan up to the root WITH its module
-prefix, so a plan on ``llm_config`` surfaces as ``language_model.<base>.layers.*`` and matches the
-real parameter paths -- while a plan on the top config reaches no expert at all.
+What differs is where the expert-parallel plan has to be attached: on the nested language-model
+config, not the VLM root. transformers aggregates each sub-model's plan up to the root WITH its
+module prefix, so a plan there surfaces as ``language_model.<base>.layers.*`` and matches the real
+parameter paths -- while a plan on the top config reaches no expert at all.
 
 Only that plan is registered under the root type, so lookups of the MoE and export sections by
 ``nemotron_h_omni`` find neither. No export depends on them: on transformers 5 the language
@@ -36,13 +36,13 @@ __all__: list[str] = []
 register(
     ModelSpec(
         model_type="nemotron_h_omni",
-        # transformers ships the Omni VLM itself from 5.18. Expert parallelism still runs on the
-        # checkpoint's own code (``trust_remote_code=True``), whose sub-model config is the
-        # ``llm_config`` the plan below targets; transformers' port names it ``text_config``.
+        # transformers ships the Omni VLM itself from 5.18. The checkpoint's own code
+        # (``trust_remote_code=True``) names the language-model config ``llm_config``, and
+        # transformers' port ``text_config``: the plan goes on whichever the config has.
         min_transformers_version="5.18",
         ep_spec=EPSpec(
             base_model_ep_plan=BASE_MODEL_EP_PLAN,
-            plan_config_attr="llm_config",
+            plan_config_attr=("llm_config", "text_config"),
         ),
     )
 )

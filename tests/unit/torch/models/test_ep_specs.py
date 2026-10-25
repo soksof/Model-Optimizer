@@ -65,7 +65,7 @@ def test_the_omni_vlm_reuses_the_text_models_plan():
 
 def test_the_omni_vlm_puts_its_plan_on_the_nested_config():
     """Its experts live in the language sub-model, and the globs are written against that tree."""
-    assert get_spec("nemotron_h_omni").ep_spec.plan_config_attr == "llm_config"
+    assert get_spec("nemotron_h_omni").ep_spec.plan_config_attr == ("llm_config", "text_config")
     assert get_spec("nemotron_h").ep_spec.plan_config_attr is None
 
 
@@ -90,16 +90,20 @@ def test_the_attached_plan_is_a_copy():
     assert "injected" not in get_spec("deepseek_v3").ep_spec.base_model_ep_plan
 
 
-def test_a_vlm_plan_lands_on_the_nested_config_only():
-    """On the root config the globs match no parameter, and the failure is silence, not an error."""
-    config = cfg(llm_config=cfg())
+@pytest.mark.parametrize("attr", ["llm_config", "text_config"])
+def test_a_vlm_plan_lands_on_the_nested_config_only(attr):
+    """On the root config the globs match no parameter, and the failure is silence, not an error.
+    The Omni checkpoint's own code names that config llm_config, and transformers' port
+    text_config: a multi-rank run of either applies the spec, whether it wants experts sharded or
+    not."""
+    config = cfg(**{attr: cfg()})
     apply_distributed_support("nemotron_h_omni", config)
-    assert config.llm_config.base_model_ep_plan
+    assert getattr(config, attr).base_model_ep_plan
     assert not hasattr(config, "base_model_ep_plan")
 
 
 def test_a_missing_nested_config_is_an_error_not_a_silent_skip():
-    with pytest.raises(ValueError, match="llm_config"):
+    with pytest.raises(ValueError, match=r"config\.llm_config or config\.text_config"):
         apply_distributed_support("nemotron_h_omni", cfg())
 
 
