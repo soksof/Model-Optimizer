@@ -58,6 +58,26 @@ def checkpoint_to_patch(
     return ckpt_path
 
 
+def refuse_quantization_only_on_text_config(label: str, hf_config) -> None:
+    """Refuse a checkpoint whose ``quantization_config`` only its ``text_config`` declares.
+
+    The adapter replaces ``text_config`` with a native config without it. Unless the experts
+    decompress as they load, the expert-parallel load then reads the checkpoint's quantization off
+    the top-level config, which Kimi-K2.5's config class copies it to; without that copy, the load
+    would read quantized experts as stored.
+    """
+    if (
+        getattr(hf_config.text_config, "quantization_config", None) is not None
+        and getattr(hf_config, "quantization_config", None) is None
+    ):
+        raise ValueError(
+            f"{label}: the checkpoint declares quantization_config on text_config only, which the "
+            "native deepseek_v3 config replacing it drops, so the expert-parallel load would read "
+            "its experts as stored. Declare it on the top-level config too, or start from an "
+            "unquantized copy of the model."
+        )
+
+
 def install_compat_import_shims() -> None:
     """Add stubs for symbols the Kimi modeling imports that newer transformers removed, so it imports.
 

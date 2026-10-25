@@ -79,6 +79,13 @@ def _vlm_config():
     return SimpleNamespace(text_config=text)
 
 
+def _block_fp8_on_the_text_config_only():
+    config = _vlm_config()
+    block_fp8 = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    config.text_config.quantization_config = block_fp8
+    return config
+
+
 @pytest.fixture
 def remote(monkeypatch, request):
     """Stand in for the checkpoint's remote code: importing it registers its modeling module
@@ -220,8 +227,21 @@ def test_the_swap_fails_loudly_when_the_remote_modeling_has_nothing_to_swap(
         # transformers' get_class_from_dynamic_module runs the checkpoint's code without checking
         # trust_remote_code, so prepare must refuse before reaching it.
         (_vlm_config, {"ckpt_path": "/ckpt"}, "trust_remote_code=True"),
+        # The native text config drops the scheme, and with no top-level copy for the load to
+        # read, the experts would load as stored.
+        (
+            _block_fp8_on_the_text_config_only,
+            {"ckpt_path": "/ckpt", "trust_remote_code": True},
+            "on text_config only",
+        ),
     ],
-    ids=["transformers-port", "no-text-config", "no-checkpoint", "untrusted-checkpoint"],
+    ids=[
+        "transformers-port",
+        "no-text-config",
+        "no-checkpoint",
+        "untrusted-checkpoint",
+        "quantized-text-config-only",
+    ],
 )
 def test_prepare_refuses_before_patching_anything(monkeypatch, adapter, config, kwargs, match):
     """Before prepare patches anything process-wide, such as the loader's remote-code staging, or

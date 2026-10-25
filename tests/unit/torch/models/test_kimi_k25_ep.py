@@ -117,6 +117,8 @@ def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(
     staging = dmu.get_cached_module_file
     config = _vlm_config()
     config.text_config.quantization_config = quantization_config
+    if quantization_config is not QUANT:
+        config.quantization_config = quantization_config  # the top-level copy the load reads
 
     assert kimi_k25.prepare(config, ckpt_path="/ckpt", trust_remote_code=True) is config
 

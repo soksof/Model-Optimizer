@@ -130,17 +130,30 @@ def test_a_patch_stays_on_a_module_transformers_loads_again(
             del sys.modules[name]
 
 
-def test_only_remote_modules_are_patched(monkeypatch):
+@pytest.mark.parametrize(
+    "defined_in",
+    [
+        "transformers.models.kimi_k25.modeling_kimi_k25",
+        "transformers_modules.Kimi.4567cdef.modeling_kimi_k25",  # not in sys.modules
+    ],
+    ids=["port", "not-loaded"],
+)
+def test_only_remote_modules_are_patched(monkeypatch, defined_in):
     """transformers' own port of a model can share its remote module's name (from 5.13,
     ``transformers.models.kimi_k25.modeling_kimi_k25``); a patch for the checkpoint's code must
-    leave it alone."""
-    monkeypatch.setattr(dmu, "get_class_in_module", dmu.get_class_in_module)
-    monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
+    leave it alone. So must the re-patch when transformers resolves a class, which reaches the
+    module defining it: a remote module can import its class from the port, or from a module
+    sys.modules does not hold."""
     remote = ModuleType("transformers_modules.Kimi.0123abcd.modeling_kimi_k25")
     port = ModuleType("transformers.models.kimi_k25.modeling_kimi_k25")
     for module in (remote, port):
         monkeypatch.setitem(sys.modules, module.__name__, module)
+    cls = type("KimiK25ForConditionalGeneration", (), {"__module__": defined_in})
+    monkeypatch.setattr(dmu, "get_class_in_module", lambda *args, **kwargs: cls)
+    monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
     seen = []
 
     assert keep_patched(".modeling_kimi_k25", seen.append) == [remote.__name__]
+    module_path = f"{remote.__name__.replace('.', '/')}.py"  # the remote module, as loaded
+    assert dmu.get_class_in_module(cls.__name__, module_path) is cls
     assert seen == [remote]

@@ -74,6 +74,17 @@ def stage_full_remote_closure() -> None:
 _KEPT_PATCHES: dict[str, Callable[[ModuleType], bool]] = {}
 
 
+def _is_remote(name: str, suffix: str) -> bool:
+    """Whether the module ``name`` is remote code named ``*<suffix>``.
+
+    transformers' own port of a model can share the remote module's name, as
+    transformers.models.kimi_k25.modeling_kimi_k25 does from 5.13.
+    """
+    import transformers.dynamic_module_utils as dmu
+
+    return name.startswith(f"{dmu.TRANSFORMERS_DYNAMIC_MODULE_NAME}.") and name.endswith(suffix)
+
+
 def keep_patched(suffix: str, patch: Callable[[ModuleType], bool]) -> list[str]:
     """Apply ``patch`` to every loaded remote module named ``*<suffix>``, and again whenever
     transformers resolves a class from one.
@@ -93,8 +104,15 @@ def keep_patched(suffix: str, patch: Callable[[ModuleType], bool]) -> list[str]:
 
         def _resolved(class_name, module_path, *args, **kwargs):
             cls = orig(class_name, module_path, *args, **kwargs)
+            # The class's own module, which need not be the remote one transformers loaded (that
+            # can import the class from transformers' own port) and need not be in sys.modules.
+            module = sys.modules.get(cls.__module__)
             for kept_suffix, kept_patch in _KEPT_PATCHES.items():
-                if cls.__module__.endswith(kept_suffix) and kept_patch(sys.modules[cls.__module__]):
+                if (
+                    module is not None
+                    and _is_remote(cls.__module__, kept_suffix)
+                    and kept_patch(module)
+                ):
                     from modelopt.torch.utils import distributed as dist
 
                     print(
@@ -107,11 +125,8 @@ def keep_patched(suffix: str, patch: Callable[[ModuleType], bool]) -> list[str]:
         setattr(_resolved, "_modelopt_keep_patched", True)
         dmu.get_class_in_module = _resolved
     patched = []
-    # Remote modules only: transformers' own port of a model can share the module's name, as
-    # transformers.models.kimi_k25.modeling_kimi_k25 does from 5.13.
-    remote = f"{dmu.TRANSFORMERS_DYNAMIC_MODULE_NAME}."
     for name, module in list(sys.modules.items()):
-        if module is not None and name.startswith(remote) and name.endswith(suffix):
+        if module is not None and _is_remote(name, suffix):
             patch(module)
             patched.append(name)
     return patched

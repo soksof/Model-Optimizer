@@ -57,6 +57,7 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     Kimi-VL checkpoint is plain bf16.
     """
     ckpt_path = _kimi.checkpoint_to_patch("kimi_vl", hf_config, ckpt_path, trust_remote_code)
+    _kimi.refuse_quantization_only_on_text_config("kimi_vl", hf_config)
 
     _kimi.install_compat_import_shims()
     stage_full_remote_closure()

@@ -71,10 +71,13 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     #    quantization_config, which Kimi-K2.5 carries only on the text_config step 2 replaces. It
     #    goes first, so a checkpoint it refuses leaves everything as it was. Experts stored
     #    otherwise are the expert-parallel load's to read: bf16 as they are, block-fp8 by the copy
-    #    of quantization_config Kimi's config class keeps on the top-level config.
+    #    of quantization_config Kimi's config class keeps on the top-level config, which step 2
+    #    leaves alone. A checkpoint without that copy is refused.
     quantization_config = _onfly_decompress._find_quantization_config(hf_config) or {}
     if quantization_config.get("quant_method") == "compressed-tensors":
         _onfly_decompress.install_onfly_decompress(hf_config)
+    else:
+        _kimi.refuse_quantization_only_on_text_config("kimi_k25", hf_config)
 
     # transformers stages only 1-hop relative imports; Kimi's remote code is 2 hops deep. Install the
     # full-closure staging shim BEFORE any remote-code load (this plugin's get_class_from_dynamic_module
