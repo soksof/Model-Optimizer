@@ -22,6 +22,7 @@ over, and ``_ckpt_quant_method`` reads the checkpoint's native quantization. Eve
 CPU process.
 """
 
+import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -290,8 +291,8 @@ def quant_wrappers():
 
 def test_routed_experts_with_a_quant_wrapper_of_their_own_are_refused(quant_wrappers):
     """Quantization would convert them to it, whose forward drops the process group the all-to-all
-    transport passes in. The registry serves every model in the process, so it is left as it is; the
-    shared experts, which the transport does not manage, may keep a wrapper."""
+    transport passes in. The registry serves every model in the process, so no registration is
+    added or removed; the shared experts, which the transport does not manage, may keep a wrapper."""
     model = _model_with_decoder_at("model.")
 
     with pytest.raises(NotImplementedError, match=r"cannot quantize _Experts: ModelOpt quantizes"):
@@ -463,3 +464,78 @@ def test_from_pretrained_builds_its_mesh_from_the_ep_mesh_it_is_given():
     with pytest.raises(RuntimeError), _experts_sharded_over(ep_mesh):
         raise RuntimeError("the load failed")
     assert mixin.initialize_distributed_mesh is builder
+
+
+@pytest.mark.parametrize(
+    ("fields", "builds_its_mesh", "config", "tp_plan"),
+    [
+        # transformers 5.6-5.9, 5.11, 5.12
+        (["enable_expert_parallel"], False, {"enable_expert_parallel": True}, "auto"),
+        # 5.10, 5.13-5.17
+        (
+            ["tp_size", "tp_plan", "enable_expert_parallel"],
+            False,
+            {"enable_expert_parallel": True, "tp_plan": "auto"},
+            None,
+        ),
+        # 5.18 on
+        (
+            ["tp_size", "tp_plan", "enable_expert_parallel"],
+            True,
+            {"enable_expert_parallel": True, "tp_plan": "auto", "tp_size": 2},
+            None,
+        ),
+        # no release so far
+        (
+            ["tp_size", "enable_expert_parallel"],
+            True,
+            {"enable_expert_parallel": True, "tp_size": 2},
+            "auto",
+        ),
+    ],
+    ids=["no-tp-plan-field", "tp-plan-field", "own-mesh-builder", "own-mesh-builder-no-tp-plan"],
+)
+def test_each_load_argument_goes_where_this_transformers_takes_it(
+    ep_world_of_two, monkeypatch, fields, builds_its_mesh, config, tp_plan
+):
+    """``tp_plan="auto"`` goes on ``DistributedConfig`` where it has the field, else to
+    ``from_pretrained``, never both; a release that builds its own mesh gets it sized to the EP
+    degree. Each is decided by its own field, so a release with one and not the other loads too."""
+
+    class _LoadedError(Exception):
+        """Stops the load at from_pretrained."""
+
+    loaded = {}
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            loaded.update(kwargs)
+            raise _LoadedError
+
+    import transformers.distributed as hf_distributed
+
+    distributed_config = dataclasses.make_dataclass(
+        "DistributedConfig", [(name, object, dataclasses.field(default=None)) for name in fields]
+    )
+    monkeypatch.setattr(hf_distributed, "DistributedConfig", distributed_config)
+    monkeypatch.setattr(
+        model_load_utils,
+        "_transformers_mesh_builder",
+        lambda: SimpleNamespace(initialize_distributed_mesh=None) if builds_its_mesh else None,
+    )
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+
+    with pytest.raises(_LoadedError):
+        load_and_prepare_ep(
+            "org/model",
+            DistributionPlan(2, ep_size=2),
+            hf_config=SimpleNamespace(base_model_ep_plan=_EP_PLAN),
+        )
+
+    given = {k: v for k, v in vars(loaded["distributed_config"]).items() if v is not None}
+    assert given == config
+    assert loaded.get("tp_plan") == tp_plan

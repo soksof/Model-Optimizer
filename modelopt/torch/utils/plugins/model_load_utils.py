@@ -1426,20 +1426,10 @@ def _refuse_unquantizable_experts(expert_modules) -> None:
             "weights transposed, which the grouped quantization leaves unquantized. Quantize the "
             "model without expert parallelism."
         )
-    from modelopt.torch.quantization.nn.modules.quant_module import QuantModuleRegistry
-    from modelopt.torch.quantization.plugins.huggingface import _QuantFusedExperts
+    from modelopt.torch.quantization.plugins.huggingface import _eager_only_experts
 
-    wrapped = sorted(
-        {
-            type(m).__name__
-            for m in expert_modules
-            if type(m) in QuantModuleRegistry
-            and (
-                not issubclass(wrapper := QuantModuleRegistry[type(m)], _QuantFusedExperts)
-                or wrapper._eager_only
-            )
-        }
-    )
+    # Quantization's own torch_a2a check refuses the same experts; this refuses them at load.
+    wrapped = _eager_only_experts(expert_modules)
     if wrapped:
         raise NotImplementedError(
             f"Expert-parallel PTQ cannot quantize {', '.join(wrapped)}: ModelOpt quantizes these "
@@ -1534,7 +1524,9 @@ def load_and_prepare_ep(
     ``plan`` is the expert-parallel :class:`~modelopt.torch.utils.distributed.DistributionPlan` to load
     by (``ep_size > 1``), for the whole process group. It records no plan on the model: the caller
     does (:func:`~modelopt.torch.utils.distributed.set_distribution_plan`), as
-    :func:`load_pretrained` does for every load.
+    :func:`load_pretrained` does for every load. The model builds with its LM head where an auto
+    class builds one; ``require_lm_head=False`` builds a VLM without it, through ``AutoModel`` (a
+    causal LM always keeps its head).
 
     Builds an ``(edp, ep)`` device mesh and loads experts EP-sharded over the ``ep`` submesh
     (``enable_expert_parallel=True`` -- each rank owns ``num_experts / ep`` experts as grouped-GEMM
@@ -1650,24 +1642,24 @@ def load_and_prepare_ep(
     # ``tp_size > 1`` in prepare_distribute_model. Dense params stay REPLICATED (= our DP) because
     # ``swapped_plan`` below keeps only expert entries; attention/embeds match no plan key.
     #
-    # WHERE it goes is version-dependent: transformers >=5.16 raises if tp_plan is passed alongside
-    # distributed_config ("Set tensor-parallel options on DistributedConfig when using it"); older
-    # releases have no tp_plan field on DistributedConfig at all. Passing tp_plan ALONE is not an
-    # option either -- the >=5.16 back-compat path rebuilds the config as
+    # WHERE it goes is version-dependent: from transformers 5.17 from_pretrained refuses tp_plan
+    # beside distributed_config ("Set tensor-parallel options on DistributedConfig when using it"),
+    # while DistributedConfig has no tp_plan field before 5.10, nor in 5.11 and 5.12. Passing
+    # tp_plan ALONE is not an option either -- the 5.17+ back-compat path rebuilds the config as
     # DistributedConfig(tp_plan=..., tp_size=...) and DROPS enable_expert_parallel, silently losing
-    # EP. So decide from the dataclass fields, which tell the two apart on any release.
+    # EP. So each argument goes on DistributedConfig where it has a field for it, and tp_plan
+    # otherwise to from_pretrained: the dataclass fields tell them apart on any release.
     import dataclasses as _dc
 
-    _dc_has_tp_plan = any(f.name == "tp_plan" for f in _dc.fields(DistributedConfig))
-    if _transformers_mesh_builder() is not None:
+    _dc_fields = {f.name for f in _dc.fields(DistributedConfig)}
+    _dc_has_tp_plan = "tp_plan" in _dc_fields
+    dc_kwargs: dict[str, Any] = {"enable_expert_parallel": True}
+    if _dc_has_tp_plan:
+        dc_kwargs["tp_plan"] = "auto"
+    if _transformers_mesh_builder() is not None and "tp_size" in _dc_fields:
         # This release sizes its own mesh from tp_size; _experts_sharded_over swaps in the EP mesh.
-        distributed_config = DistributedConfig(
-            enable_expert_parallel=True, tp_plan="auto", tp_size=ep_degree
-        )
-    elif _dc_has_tp_plan:
-        distributed_config = DistributedConfig(enable_expert_parallel=True, tp_plan="auto")
-    else:
-        distributed_config = DistributedConfig(enable_expert_parallel=True)
+        dc_kwargs["tp_size"] = ep_degree
+    distributed_config = DistributedConfig(**dc_kwargs)
     from_pretrained_kwargs: dict[str, Any] = {
         "dtype": dtype,
         "device_mesh": ep_submesh,
@@ -1721,8 +1713,9 @@ def load_and_prepare_ep(
         print(f"[ep] ep_plan={swapped_plan} experts_implementation=torch_a2a", flush=True)
     # The class that builds the whole checkpoint -- with its lm_head where an auto class builds one,
     # so the head is calibrated and exported and the generation preview works -- chosen as the
-    # distribution plan's decision chose it. The per-model plugin (models/) has already installed
-    # any on-the-fly weight decompression as a transformers monkeypatch.
+    # distribution plan's decision chose it, unless the caller asked for a VLM without its head
+    # (require_lm_head=False). The per-model plugin (models/) has already installed any on-the-fly
+    # weight decompression as a transformers monkeypatch.
     loader = _auto_class(hf_config, require_lm_head, trust_remote_code=trust_remote_code)
     if is_master():
         print(f"[ep] loader={loader.__name__} (require_lm_head={require_lm_head})", flush=True)

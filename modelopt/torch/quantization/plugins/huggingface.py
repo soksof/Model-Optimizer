@@ -1553,6 +1553,24 @@ def register_fused_experts_on_the_fly(model):
             QuantModuleRegistry.register({mod_type: f"hf.{mod_type.__name__}"})(wrapper)
 
 
+def _eager_only_experts(modules) -> list[str]:
+    """Names of the expert classes in ``modules`` ModelOpt quantizes on the eager forward only.
+
+    A class with its own quantized wrapper -- GPT-OSS's quantizes down_proj's input by intercepting
+    the eager forward's bmm/matmul -- only works on the eager forward, and so does a fused-experts
+    wrapper that says so (FP8's). The registry lookup caches the dynamic class it generates, as
+    quantizing the module would.
+    """
+    return sorted(
+        {
+            type(module).__name__
+            for module in modules
+            if (wrapper := QuantModuleRegistry.get(type(module))) is not None
+            and (not issubclass(wrapper, _QuantFusedExperts) or wrapper._eager_only)
+        }
+    )
+
+
 def normalize_experts_impl_on_the_fly(model):
     """Redirect HF fused-experts modules onto a quantization-supported backend.
 
@@ -1587,17 +1605,8 @@ def normalize_experts_impl_on_the_fly(model):
     # (all-to-all DP=EP) runs its local experts through the same `_grouped_linear`, so _QuantFusedExperts
     # intercepts it too -- don't clobber it back to grouped_mm.
     supported_impls = (None, "eager", "grouped_mm", "torch_a2a")
-    # A class with its own quantized wrapper -- GPT-OSS's quantizes down_proj's input by intercepting
-    # the eager forward's bmm/matmul -- only works on the eager forward, and so does a fused-experts
-    # wrapper that says so (FP8's), so keep main's forced eager for such a model.
-    eager_only = sorted(
-        {
-            type(module).__name__
-            for module in fused_experts
-            if (wrapper := QuantModuleRegistry.get(type(module))) is not None
-            and (not issubclass(wrapper, _QuantFusedExperts) or wrapper._eager_only)
-        }
-    )
+    # Experts that quantize on the eager forward only keep main's forced eager.
+    eager_only = _eager_only_experts(fused_experts)
 
     def _configs(cfg):
         if cfg is not None:
