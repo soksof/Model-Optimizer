@@ -434,24 +434,34 @@ def test_a_vlm_marked_at_either_level_loads_through_the_rewritten_converters(
             SimpleNamespace(text_config=SimpleNamespace(quantization_config={"at": "text"})),
             {"at": "text"},
         ),
-        ({"text_config": {"quantization_config": {"at": "dict"}}}, {"at": "dict"}),
         (
             SimpleNamespace(quantization_config=SimpleNamespace(to_dict=lambda: {"at": "obj"})),
             {"at": "obj"},
         ),
     ],
-    ids=["top-level-first", "text-config", "raw-dict", "config-object"],
+    ids=["top-level-first", "text-config", "config-object"],
 )
 def test_the_quantization_config_is_found_at_the_top_level_then_on_the_text_config(config, found):
     """A VLM may carry its compressed-tensors config at the top level or on ``text_config``, as a
-    config object or a raw dict; it is always returned as a plain dict."""
+    config object or a dict; it is always returned as a plain dict."""
     assert onfly._find_quantization_config(config) == found
 
 
 @pytest.mark.usefixtures("restore_loader_hooks")
-def test_a_config_with_nothing_to_decompress_leaves_the_loader_alone(monkeypatch):
+@pytest.mark.parametrize(
+    ("config", "error", "match"),
+    [
+        (SimpleNamespace(text_config=SimpleNamespace()), ValueError, "quantization_config"),
+        ({"quantization_config": {"format": "pack-quantized"}}, TypeError, "not a dict"),
+    ],
+    ids=["nothing-to-decompress", "raw-dict"],
+)
+def test_a_config_with_nothing_to_decompress_leaves_the_loader_alone(
+    monkeypatch, config, error, match
+):
     """By the time a bf16 checkpoint's caller sees that error, nothing may be patched yet -- and
-    compressed_tensors, which such a checkpoint never needs, need not be installed."""
+    compressed_tensors, which such a checkpoint never needs, need not be installed. Nor for a raw
+    dict, which cannot carry the mark its load would be found by."""
     monkeypatch.setitem(sys.modules, "compressed_tensors", None)
     hooks = (
         mu.get_model_conversion_mapping,
@@ -460,8 +470,8 @@ def test_a_config_with_nothing_to_decompress_leaves_the_loader_alone(monkeypatch
         cml._materialize_copy,
     )
 
-    with pytest.raises(ValueError, match="quantization_config"):
-        onfly.install_onfly_decompress(SimpleNamespace(text_config=SimpleNamespace()))
+    with pytest.raises(error, match=match):
+        onfly.install_onfly_decompress(config)
 
     assert (
         mu.get_model_conversion_mapping,
@@ -469,6 +479,56 @@ def test_a_config_with_nothing_to_decompress_leaves_the_loader_alone(monkeypatch
         WeightConverter.materialize_tensors,
         cml._materialize_copy,
     ) == hooks
+
+
+EXPERT = "model.layers.1.mlp.experts.0.gate_proj"
+ATTENTION = "model.layers.1.self_attn.q_proj"
+SHARED_EXPERT = "model.layers.1.mlp.shared_experts.up_proj"  # a dense MLP, not the routed experts
+
+
+@pytest.mark.parametrize(
+    ("stored_as", "names", "match"),
+    [
+        (
+            PACKED,
+            [f"{EXPERT}.{n}" for n in PACKED] + [f"{ATTENTION}.weight", f"{SHARED_EXPERT}.weight"],
+            None,
+        ),
+        (
+            ("weight", "weight_scale"),
+            [f"{EXPERT}.weight", f"{EXPERT}.weight_scale", f"{ATTENTION}.weight"],
+            None,
+        ),
+        (PACKED, [f"{p}.{n}" for p in (EXPERT, ATTENTION) for n in PACKED], "1 of them outside"),
+        (PACKED, [f"{EXPERT}.weight"] + [f"{ATTENTION}.{n}" for n in PACKED], "1 of them outside"),
+        (
+            PACKED,
+            [f"{EXPERT}.{n}" for n in PACKED] + ["model.layers.1.mlp.experts.1.gate_proj.weight"],
+            "1 expert weights uncompressed",
+        ),
+        (PACKED, [f"{ATTENTION}.weight", f"{SHARED_EXPERT}.weight"], "compresses 0 weights"),
+    ],
+    ids=[
+        "experts-alone",
+        "experts-alone-float-format",
+        "every-linear",
+        "all-but-the-experts",
+        "an-expert-left-uncompressed",
+        "nothing-compressed",
+    ],
+)
+def test_a_checkpoint_must_compress_its_experts_and_nothing_else(stored_as, names, match):
+    """The config cannot say which modules a class target such as Linear compressed, so the names
+    the checkpoint stores decide: anything else compressed, or an expert stored uncompressed, would
+    load newly initialized, without a quantizer to load it or a converter that reads it."""
+    config = SimpleNamespace(text_config=SimpleNamespace())
+    onfly._mark(config.text_config, stored_as)
+
+    if match is None:
+        onfly.check_compressed_keys(config, names)
+    else:
+        with pytest.raises(NotImplementedError, match=match):
+            onfly.check_compressed_keys(config, names)
 
 
 class _RemoteTextConfig(PretrainedConfig):

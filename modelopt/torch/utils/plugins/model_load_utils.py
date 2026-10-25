@@ -2354,8 +2354,13 @@ def load_and_prepare_ep(
         # class copies its text config's to the top level), the checkpoint's quantization_config
         # would build transformers' compressed-tensors quantizer, which from 5.13 claims the same
         # expert converters first. Deleted rather than set to None: before 5.11 transformers takes
-        # any quantization_config attribute, None too, for a quantized checkpoint.
-        for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        # any quantization_config attribute, None too, for a quantized checkpoint. Every level
+        # _ckpt_quant_method reads is cleared.
+        for cfg in (
+            hf_config,
+            getattr(hf_config, "text_config", None),
+            getattr(hf_config, "llm_config", None),
+        ):
             if cfg is not None and hasattr(cfg, "quantization_config"):
                 del cfg.quantization_config
     ep_cfg = _ep_config(hf_config)  # for VLMs the plan lives on .text_config
@@ -2381,6 +2386,12 @@ def load_and_prepare_ep(
     # from, take the local snapshot: a Hub ID recorded there would leave the export nothing to read.
     # Resolved once the plan and the config pass, so a refused load downloads nothing.
     ckpt_path = _resolve_checkpoint_dir(ckpt_path, torch.distributed.get_rank())
+    if _decompressed_as_loaded(hf_config):
+        # Only the experts decompress as they load, and the config cannot say what else the
+        # checkpoint compressed: its stored names are checked before anything loads.
+        from modelopt.torch.models import _onfly_decompress
+
+        _onfly_decompress.check_compressed_keys(hf_config, checkpoint_tensor_files(ckpt_path))
 
     # Two INDEPENDENT meshes (NeMo-AutoModel style), named by the model part they govern -- two
     # factorizations of the same world:

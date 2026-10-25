@@ -63,10 +63,10 @@ def to_native_backbone_config(
     d["model_type"] = model_type
     d["architectures"] = list(architectures)
     native = CONFIG_MAPPING[model_type].from_dict(d)
-    fmt = getattr(vlm_config, _MARK, None) or getattr(text_config, _MARK, None)
-    if fmt is not None:
+    stored_as = getattr(vlm_config, _MARK, None) or getattr(text_config, _MARK, None)
+    if stored_as is not None:
         # A backbone loaded from this config on its own decompresses as the VLM would.
-        _mark(native, fmt)
+        _mark(native, stored_as)
     return native
 
 
@@ -77,10 +77,6 @@ def _find_quantization_config(hf_config):
     if qc is None:
         tc = getattr(hf_config, "text_config", None)
         qc = getattr(tc, "quantization_config", None) if tc is not None else None
-    if qc is None and isinstance(hf_config, dict):
-        qc = hf_config.get("quantization_config") or (hf_config.get("text_config") or {}).get(
-            "quantization_config"
-        )
     if qc is None:
         return None
     if hasattr(qc, "to_dict"):
@@ -123,9 +119,10 @@ def _read_compression(hf_config):
             "compressing only the experts. Decompress the checkpoint first."
         )
     [scheme] = groups.values()
-    # The experts' group as transformers' own compressed-tensors loader finds it: a class target
-    # (the checkpoint's experts are Linear modules) or a regex naming the experts. Another group
-    # leaves the experts stored as plain weights, which the rewritten converters would not find.
+    # A group of regex targets alone must name the experts, or it leaves them stored as plain weights
+    # the rewritten converters would not find. A class target such as Linear does not say which
+    # modules it compressed (the experts, and any Linear the ignore list leaves): the expert-parallel
+    # load checks the names the checkpoint stores instead (check_compressed_keys).
     if not any(not t.startswith("re:") or "experts" in t for t in scheme.targets):
         raise NotImplementedError(
             f"install_onfly_decompress: the checkpoint's compressed-tensors config group targets "
@@ -268,13 +265,14 @@ def _install_keep_int_native():
     cml._materialize_copy = _materialize_copy
 
 
-# Marks a config whose model's converters the installed hooks rewrite (holds the checkpoint's format).
+# Marks a config whose model's converters the installed hooks rewrite (holds the names each
+# compressed weight is stored under).
 _MARK = "_modelopt_onfly_decompress"
 
 
-def _mark(hf_config, fmt):
+def _mark(hf_config, stored_as):
     """Mark ``hf_config``'s load for the installed hooks; ``from_pretrained``'s copy of it keeps the mark."""
-    setattr(hf_config, _MARK, fmt)
+    setattr(hf_config, _MARK, stored_as)
 
 
 def is_marked(hf_config) -> bool:
@@ -295,10 +293,14 @@ def install_onfly_decompress(hf_config):
     model built from a marked config, or from one whose ``text_config`` is marked, has its converters
     rewritten; any other model ``from_pretrained`` loads in the process, an uncompressed MoE say,
     keeps its stock converters. :func:`to_native_backbone_config` carries the mark to the backbone
-    config it derives."""
+    config it derives, and the expert-parallel load checks the checkpoint against it
+    (:func:`check_compressed_keys`)."""
     from modelopt.torch.utils import print_rank_0
     from modelopt.torch.utils.moe import require_transformers
 
+    if isinstance(hf_config, dict):
+        # The load finds the hooks by a mark on the config object, which a dict cannot carry.
+        raise TypeError("install_onfly_decompress: pass the model's config object, not a dict")
     compression = _read_compression(hf_config)
     require_transformers("5.8", "on-the-fly compressed-tensors decompression")
     # Imported once the release is known to have them: transformers 4 has no core_model_loading.
@@ -318,7 +320,7 @@ def install_onfly_decompress(hf_config):
                 f"stored params {compression[2]}) needs a process of its own"
             )
         # The same checkpoint through a config of its own, which its load must find marked too.
-        _mark(hf_config, installed[3])
+        _mark(hf_config, installed[2])
         return
     if compression is None:
         # Nothing to decompress: refused before anything is patched.
@@ -354,8 +356,39 @@ def install_onfly_decompress(hf_config):
 
     setattr(patched, "_onfly_compression", compression)
     mu.get_model_conversion_mapping = patched
-    _mark(hf_config, fmt)
+    _mark(hf_config, param_names)
     print_rank_0(
         f"[onfly_decompress] installed: compressed_tensors '{fmt}' fused-MoE experts decompress "
         f"(stored params={param_names}) -> bf16 during from_pretrained"
     )
+
+
+def check_compressed_keys(hf_config, tensor_names) -> None:
+    """Refuse a checkpoint that compresses anything but its experts, or leaves an expert uncompressed.
+
+    The hooks rewrite only the experts' converters, and the expert-parallel load drops the
+    quantization_config that would load any other compressed weight: a weight compressed outside the
+    experts would load newly initialized, and so would an expert stored uncompressed, which the
+    rewritten converters do not read. ``tensor_names`` are the checkpoint's. A weight counts as
+    compressed when it stores a name ``hf_config``'s mark holds other than ``weight``, which an
+    uncompressed weight is stored under too.
+    """
+    configs = (hf_config, getattr(hf_config, "text_config", None))
+    stored_as = next(getattr(c, _MARK) for c in configs if getattr(c, _MARK, None) is not None)
+    compressed: set[str] = set()
+    expert_weights: set[str] = set()
+    for name in tensor_names:
+        stem, _, stored = name.rpartition(".")
+        if stored in stored_as and stored != "weight":
+            compressed.add(stem)
+        elif stored == "weight" and ".experts." in name:
+            expert_weights.add(stem)
+    outside = sorted(stem for stem in compressed if ".experts." not in stem)
+    plain = sorted(expert_weights - compressed)
+    if outside or plain or not compressed:
+        raise NotImplementedError(
+            f"The checkpoint compresses {len(compressed)} weights, {len(outside)} of them outside the "
+            f"experts {outside[:1]}, and stores {len(plain)} expert weights uncompressed {plain[:1]}: "
+            "on-the-fly decompression loads the experts alone, every one compressed, so the rest "
+            "would load newly initialized. Decompress the checkpoint first."
+        )
