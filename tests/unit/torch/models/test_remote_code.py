@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Staging every module of a local checkpoint's remote code."""
+"""Staging every module of a local checkpoint's remote code, and keeping a patch on it."""
 
 import shutil
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,7 @@ import pytest
 dmu = pytest.importorskip("transformers.dynamic_module_utils")
 
 from modelopt.torch.models import _remote_code
-from modelopt.torch.models._remote_code import stage_full_remote_closure
+from modelopt.torch.models._remote_code import keep_patched, stage_full_remote_closure
 
 
 def test_every_module_of_a_local_checkpoint_is_staged(monkeypatch, tmp_path):
@@ -84,3 +85,33 @@ def test_a_module_is_staged_whole_or_not_at_all(monkeypatch, tmp_path):
 
     dmu.get_cached_module_file(str(ckpt), "a.py")
     assert (stage / "b.py").read_text() == (ckpt / "b.py").read_text()
+
+
+def test_a_patch_stays_on_a_module_transformers_loads_again(monkeypatch, tmp_path):
+    """transformers re-executes a remote module it loads again (when the files it hashes change, or
+    forced as here), rebinding the module's globals. The patch must be back on the module the class
+    is resolved from, which is the one from_pretrained builds from."""
+    monkeypatch.setattr(dmu, "HF_MODULES_CACHE", str(tmp_path / "modules"))
+    monkeypatch.setattr(dmu, "get_class_in_module", dmu.get_class_in_module)
+    monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
+    loaded = set(sys.modules)
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "modeling_kimi_k25.py").write_text(
+        "class DeepseekV3ForCausalLM:\n    pass\n\n\nclass KimiK25ForConditionalGeneration:\n    pass\n"
+    )
+    native = type("DeepseekV3ForCausalLM", (), {})
+    ref = "modeling_kimi_k25.KimiK25ForConditionalGeneration"
+    try:
+        first = dmu.get_class_from_dynamic_module(ref, str(ckpt))
+        patched = keep_patched(
+            ".modeling_kimi_k25", lambda module: setattr(module, "DeepseekV3ForCausalLM", native)
+        )
+        again = dmu.get_class_from_dynamic_module(ref, str(ckpt), force_download=True)
+
+        assert patched == [first.__module__]
+        assert again is not first  # the module was executed again
+        assert sys.modules[again.__module__].DeepseekV3ForCausalLM is native
+    finally:
+        for name in set(sys.modules) - loaded:
+            del sys.modules[name]

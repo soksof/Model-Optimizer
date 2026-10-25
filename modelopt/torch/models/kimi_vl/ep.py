@@ -43,13 +43,11 @@ Version: no floor beyond the EP framework's 5.6; validated on transformers 5.9.0
 stand in for the symbols the remote code imports that later releases dropped.
 """
 
-import sys
-
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.moe import apply_distributed_support
 
 from .. import _onfly_decompress
-from .._remote_code import stage_full_remote_closure
+from .._remote_code import keep_patched, stage_full_remote_closure
 
 
 def _install_compat_import_shims():
@@ -148,21 +146,21 @@ def _patch_kimi_vl_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -
         trust_remote_code=trust_remote_code,
     )
 
-    patched = []
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        if mod_name.endswith(".modeling_kimi_vl") and hasattr(mod, "DeepseekV3ForCausalLM"):
-            setattr(mod, "DeepseekV3ForCausalLM", NativeDeepseekV3ForCausalLM)
-            # transformers 5.9's init_weights calls self.tie_weights(recompute_mapping=False), but
-            # Kimi-VL's remote tie_weights() has the older no-kwarg signature -> TypeError. Wrap it to
-            # swallow the extra kwargs (it only ties the LM head/embeddings; the kwargs don't apply).
-            kimi_cls = getattr(mod, "KimiVLForConditionalGeneration", None)
-            if kimi_cls is not None:
-                own_tie = vars(kimi_cls).get("tie_weights")
-                if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
-                    kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
-            patched.append(mod_name)
+    def to_native(module):
+        if not hasattr(module, "DeepseekV3ForCausalLM"):
+            return
+        module.DeepseekV3ForCausalLM = NativeDeepseekV3ForCausalLM
+        # transformers 5.9's init_weights calls self.tie_weights(recompute_mapping=False), but
+        # Kimi-VL's remote tie_weights() has the older no-kwarg signature -> TypeError. Wrap it to
+        # swallow the extra kwargs (it only ties the LM head/embeddings; the kwargs don't apply).
+        kimi_cls = getattr(module, "KimiVLForConditionalGeneration", None)
+        if kimi_cls is not None:
+            own_tie = vars(kimi_cls).get("tie_weights")
+            if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
+                kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
+
+    # Kept patched when from_pretrained resolves the class again, even from a re-executed module.
+    patched = keep_patched(".modeling_kimi_vl", to_native)
     if not patched:
         raise RuntimeError(
             "kimi_vl: could not find a loaded modeling_kimi_vl in sys.modules to monkey-patch"

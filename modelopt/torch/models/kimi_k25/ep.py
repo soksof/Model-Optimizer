@@ -49,13 +49,11 @@ Version floor: transformers >= 5.8, which the on-the-fly decompressor enforces: 
 transformers' still-evolving ``WeightConverter`` conversion-ops API.
 """
 
-import sys
-
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.moe import apply_distributed_support
 
 from .. import _onfly_decompress
-from .._remote_code import stage_full_remote_closure
+from .._remote_code import keep_patched, stage_full_remote_closure
 from ..kimi_vl.ep import _drop_tie_weights_kwargs, _install_compat_import_shims
 
 
@@ -135,22 +133,22 @@ def _patch_kimi_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -> N
         trust_remote_code=trust_remote_code,
     )
 
-    patched = []
-    for mod_name, mod in list(sys.modules.items()):
-        if mod is None:
-            continue
-        # The dynamic-module loader names the module like
-        # ``transformers_modules.<short-repo>.<hash>.modeling_kimi_k25``.
-        if mod_name.endswith(".modeling_kimi_k25") and hasattr(mod, "DeepseekV3ForCausalLM"):
-            setattr(mod, "DeepseekV3ForCausalLM", NativeDeepseekV3ForCausalLM)
-            # Like Kimi-VL's: the remote tie_weights() takes no kwargs, but transformers' post_init and
-            # load call tie_weights(recompute_mapping=False) -> TypeError.
-            kimi_cls = getattr(mod, "KimiK25ForConditionalGeneration", None)
-            if kimi_cls is not None:
-                own_tie = vars(kimi_cls).get("tie_weights")
-                if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
-                    kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
-            patched.append(mod_name)
+    def to_native(module):
+        if not hasattr(module, "DeepseekV3ForCausalLM"):
+            return
+        module.DeepseekV3ForCausalLM = NativeDeepseekV3ForCausalLM
+        # Like Kimi-VL's: the remote tie_weights() takes no kwargs, but transformers' post_init and
+        # load call tie_weights(recompute_mapping=False) -> TypeError.
+        kimi_cls = getattr(module, "KimiK25ForConditionalGeneration", None)
+        if kimi_cls is not None:
+            own_tie = vars(kimi_cls).get("tie_weights")
+            if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
+                kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
+
+    # The dynamic-module loader names the module like
+    # ``transformers_modules.<short-repo>.<hash>.modeling_kimi_k25``. It stays patched when
+    # from_pretrained resolves the class again, even from a re-executed module.
+    patched = keep_patched(".modeling_kimi_k25", to_native)
     if not patched:
         raise RuntimeError(
             "kimi_k25: could not find a loaded modeling_kimi_k25 in sys.modules to monkey-patch"

@@ -18,8 +18,11 @@
 import glob
 import os
 import shutil
+import sys
 import tempfile
 import warnings
+from collections.abc import Callable
+from types import ModuleType
 
 
 def stage_full_remote_closure() -> None:
@@ -65,3 +68,40 @@ def stage_full_remote_closure() -> None:
 
     setattr(_staged, "_modelopt_full_closure", True)
     dmu.get_cached_module_file = _staged
+
+
+# Patches keep_patched applies to remote modules, by module-name suffix.
+_KEPT_PATCHES: dict[str, Callable[[ModuleType], None]] = {}
+
+
+def keep_patched(suffix: str, patch: Callable[[ModuleType], None]) -> list[str]:
+    """Apply ``patch`` to every loaded remote module named ``*<suffix>``, and again whenever
+    transformers resolves a class from one.
+
+    transformers re-executes a remote module in place when the files it hashes change, and loads it
+    afresh under another name for another path to the same checkpoint; either way the module's
+    globals are rebound and a patch applied once is gone. Wrapping ``get_class_in_module`` re-applies
+    the patch to the module a class is resolved from, so ``from_pretrained`` builds from the patched
+    module. Returns the names of the modules patched now. Idempotent per suffix.
+    """
+    import transformers.dynamic_module_utils as dmu
+
+    _KEPT_PATCHES[suffix] = patch
+    if not getattr(dmu.get_class_in_module, "_modelopt_keep_patched", False):
+        orig = dmu.get_class_in_module
+
+        def _resolved(class_name, module_path, *args, **kwargs):
+            cls = orig(class_name, module_path, *args, **kwargs)
+            for kept_suffix, kept_patch in _KEPT_PATCHES.items():
+                if cls.__module__.endswith(kept_suffix):
+                    kept_patch(sys.modules[cls.__module__])
+            return cls
+
+        setattr(_resolved, "_modelopt_keep_patched", True)
+        dmu.get_class_in_module = _resolved
+    patched = []
+    for name, module in list(sys.modules.items()):
+        if module is not None and name.endswith(suffix):
+            patch(module)
+            patched.append(name)
+    return patched
