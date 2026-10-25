@@ -21,9 +21,10 @@ through ``get_model``. Everything after reads the plan back from the model: ever
 distributed plan calibrates on its own shard of the data, an expert-parallel one through the
 distributed forward loop, and a whole model is pinned to the rank's own GPU instead of ``"auto"``.
 
-Nothing here needs a process group or a checkpoint: the process group's rank and size are answered
-the way a torchrun launch would, the configs are tiny real transformers configs served from memory,
-and the loaders are replaced by stand-ins that record how they were called.
+Nothing here needs a checkpoint, and only the test of a VLM's all-to-all forwards needs a process
+group, of one gloo rank: elsewhere the process group's rank and size are answered the way a torchrun
+launch would, the configs are tiny real transformers configs served from memory, and the loaders are
+replaced by stand-ins that record how they were called.
 """
 
 import contextlib
@@ -44,7 +45,7 @@ from transformers import AutoConfig, DeepseekV3Config, LlamaConfig
 
 import modelopt.torch.utils.distributed as dist
 from modelopt.torch.models import get_spec
-from modelopt.torch.utils.distributed import DistributionPlan, set_distribution_plan
+from modelopt.torch.utils.distributed import DistributionPlan, ParallelState, set_distribution_plan
 from modelopt.torch.utils.plugins import model_load_utils
 from modelopt.torch.utils.plugins.model_load_utils import load_pretrained
 
@@ -598,8 +599,10 @@ def test_only_an_expert_parallel_run_calibrates_through_the_distributed_forward_
     """Only distributed_forward_loop re-plants the all-to-all forwards that quantizer insertion
     clobbers, so an expert-parallel run must calibrate through it, over the mesh load_and_prepare_ep
     loaded the experts over, image batches included: they run through the whole VLM's own forward
-    there (Nemotron-H Omni calibrates on images by default). Without expert parallelism there is
-    nothing to re-plant: FSDP2 keeps the plain loop and its split-on-OOM retry, as on main."""
+    there (Nemotron-H Omni calibrates on images by default). The loop re-plants over the model it is
+    handed, the whole model, and text batches run through the language model. Without expert
+    parallelism there is nothing to re-plant: FSDP2 keeps the plain loop and its split-on-OOM retry,
+    as on main."""
     ep_mesh, vlm_forward = object(), object()
     full_model, language_model = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
     set_distribution_plan(full_model, plan)
@@ -649,7 +652,10 @@ def test_only_an_expert_parallel_run_calibrates_through_the_distributed_forward_
     elif images:
         assert chosen == [(full_model, ep_mesh, vlm_forward)]
     else:
-        assert chosen == [(language_model, ep_mesh, None)]
+        ((model, mesh, forward),) = chosen
+        assert (model, mesh) == (full_model, ep_mesh)
+        x = torch.ones(1, 2)
+        assert torch.equal(forward({"input": x}), language_model(x))
 
 
 @pytest.mark.parametrize(
@@ -704,6 +710,112 @@ def test_an_expert_parallel_run_replants_the_all_to_all_forwards_after_quantizin
     )
 
     assert events == ["quantize"] + ([("replant", full_model, ep_mesh)] if replanted else [])
+
+
+@pytest.fixture
+def gloo_world_of_one(tmp_path):
+    """A one-rank gloo process group, for the all-to-all forwards to run on."""
+    torch.distributed.init_process_group(
+        "gloo", init_method=(tmp_path / "store").as_uri(), rank=0, world_size=1
+    )
+    yield torch.distributed.group.WORLD
+    torch.distributed.destroy_process_group()
+
+
+class _EpMesh:
+    """The expert-parallel submesh of a two-rank plan, over this process's one-rank group."""
+
+    def size(self):
+        return 2
+
+    def get_group(self):
+        return torch.distributed.group.WORLD
+
+
+def test_a_vlm_calibrated_on_text_gets_its_experts_all_to_all_forwards_back(
+    hf_ptq, gloo_world_of_one
+):
+    """Text batches run through a VLM's language model, but transformers keeps the expert-parallel
+    plan on the model from_pretrained built, and the language model's own plan names no experts.
+    Re-planted over the language model, the experts' all-to-all forward that quantizer insertion
+    drops (transformers 5.16 and later) stayed dropped, and the first batch raised for the missing
+    EP process group."""
+    pytest.importorskip("transformers", minversion="5.16")
+    from transformers import Qwen3VLMoeConfig, Qwen3VLMoeForConditionalGeneration
+    from transformers.distributed.configuration_utils import DistributedConfig
+    from transformers.distributed.tensor_parallel import ALL_PARALLEL_STYLES, _get_parameter_tp_plan
+
+    from modelopt.torch.utils.moe import register_torch_a2a
+
+    register_torch_a2a()
+    config = Qwen3VLMoeConfig(
+        text_config={
+            **_TINY,
+            "head_dim": 8,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 8,
+            "decoder_sparse_step": 1,
+        },
+        vision_config={
+            "depth": 1,
+            "hidden_size": 16,
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "out_hidden_size": 16,
+            "patch_size": 2,
+            "spatial_merge_size": 1,
+            "temporal_patch_size": 1,
+            "deepstack_visual_indexes": [],
+        },
+    )
+    # The model as load_and_prepare_ep leaves it: its plan's all-to-all styles on the language
+    # model's config and expert parallelism on the top one, the forwards from_pretrained installs
+    # for them, the experts dispatching through the all-to-all, and their seeded parallel state.
+    config.text_config.base_model_ep_plan = {
+        "layers.*.mlp.gate": "torch_a2a_router",
+        "layers.*.mlp.experts": "torch_a2a_experts",
+    }
+    config.distributed_config = DistributedConfig(enable_expert_parallel=True)
+    model = Qwen3VLMoeForConditionalGeneration(config).eval()
+    mesh = _EpMesh()
+    for name, module in model.named_modules():
+        style = _get_parameter_tp_plan(parameter_name=name, tp_plan=model.tp_plan, is_weight=False)
+        if style in ("torch_a2a_router", "torch_a2a_experts"):
+            ALL_PARALLEL_STYLES[style].install_forward(module, mesh)
+    model.config.text_config._experts_implementation = "torch_a2a"
+    model._device_mesh = mesh
+    set_distribution_plan(model, DistributionPlan(2, ep_size=2))
+    model_load_utils._seed_parallel_states(
+        model,
+        [name for name, _ in model.named_modules() if name.endswith("mlp.experts")],
+        dense_state=ParallelState(data_parallel_group=-1),
+        expert_state=ParallelState(
+            data_parallel_group=-1, expert_model_parallel_group=gloo_world_of_one
+        ),
+    )
+    language_model = model.model.language_model
+    args = SimpleNamespace(
+        qformat="int8",
+        calib_with_images=False,
+        dist_state=dist.DistributedState(rank=0, world_size=2, device=torch.device("cpu")),
+        layerwise_export=False,
+        specdec_offline_dataset=None,
+    )
+    batch = {"input_ids": torch.tensor([[1, 2, 3, 4]]), "attention_mask": torch.ones(1, 4)}
+
+    hf_ptq.mono_quantize(
+        args,
+        hf_ptq.mtq.INT8_DEFAULT_CFG,
+        model,
+        language_model,
+        model_type="qwen3_vl_moe",
+        calibration_only=False,
+        calib_dataloader=[batch],
+        is_nemotron_vl_model=False,
+    )
+
+    assert language_model.layers[0].mlp.experts.down_proj_input_quantizer.amax is not None
 
 
 class _PreviewModel(torch.nn.Module):

@@ -669,15 +669,18 @@ def mono_quantize(
                 # It also restores the use_cache guard the plain loop does not apply. Other
                 # distributed runs (FSDP2) keep the plain loop and its split-on-OOM retry. Image
                 # batches go through the VLM's own forward, as they do without expert parallelism:
-                # Nemotron-H Omni, for one, calibrates on images by default.
+                # Nemotron-H Omni, for one, calibrates on images by default. Text batches go through
+                # the language model, but the loop re-plants over the model it is handed, so that is
+                # the full model: transformers keeps the expert-parallel plan on the model
+                # from_pretrained built, and a VLM's language model names no experts in its own.
                 calibrate_loop = distributed_forward_loop(
-                    full_model if args.calib_with_images else language_model,
+                    full_model,
                     calib_dataloader,
                     device=args.dist_state.device,
                     ep_mesh=expert_parallel_mesh(full_model),
                     forward=create_vlm_calibration_forward(full_model)
                     if args.calib_with_images
-                    else None,
+                    else lambda batch: language_model(**batch),
                 )
             elif args.calib_with_images:
                 calibrate_loop = create_vlm_calibration_loop(full_model, calib_dataloader)
