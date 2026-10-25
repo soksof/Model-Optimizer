@@ -1558,6 +1558,7 @@ def load_and_prepare_ep(
     from modelopt.torch.utils.moe import (
         _EXPERTS_STYLES,
         _ep_config,
+        _num_experts_from_config,
         _routed_expert_keys,
         _routed_expert_modules,
         register_torch_a2a,
@@ -1615,6 +1616,14 @@ def load_and_prepare_ep(
         raise ValueError(
             f"base_model_ep_plan={ep_plan} styles no routed experts ({', '.join(_EXPERTS_STYLES)} "
             "or grouped_gemm), so this load would leave them whole on every rank."
+        )
+    # The all-to-all transport finds an expert's rank by dividing its id by this rank's share of
+    # the experts, which holds only when every rank holds as many.
+    num_experts = _num_experts_from_config(hf_config)
+    if num_experts % ep_degree:
+        raise ValueError(
+            f"{plan!r}: ep_size={ep_degree} must divide the {num_experts} routed experts, which the "
+            "all-to-all transport shares out equally over the expert-parallel ranks."
         )
     dtype = getattr(hf_config, "dtype", None) or torch.bfloat16
     # The weights load, and the checkpoint recorded for the export to read the unplaced tensors back

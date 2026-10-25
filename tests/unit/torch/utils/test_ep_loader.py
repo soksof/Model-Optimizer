@@ -213,6 +213,19 @@ def test_a_config_the_load_cannot_take_is_refused_before_anything_loads(
     assert ep_world_of_two == []
 
 
+def test_an_ep_size_that_does_not_divide_the_experts_is_refused_before_anything_loads(
+    ep_world_of_two,
+):
+    """The all-to-all transport finds an expert's rank by dividing its id by this rank's share of
+    the experts: with 3 experts over 2 ranks the ranks would disagree on who holds which, and send
+    tokens to the wrong experts."""
+    config = SimpleNamespace(base_model_ep_plan=_EP_PLAN, num_experts=3)
+
+    with pytest.raises(ValueError, match="ep_size=2 must divide the 3 routed experts"):
+        load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+    assert ep_world_of_two == []
+
+
 def test_a_plan_whose_expert_containers_match_no_module_is_refused(ep_world_of_two, monkeypatch):
     """A plan that styles the grouped-GEMM parameters a level below the experts names a container no
     module is. Loaded anyway, every module would get the dense state, and the experts' amax would
