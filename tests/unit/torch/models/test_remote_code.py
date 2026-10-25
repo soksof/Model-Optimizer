@@ -87,10 +87,14 @@ def test_a_module_is_staged_whole_or_not_at_all(monkeypatch, tmp_path):
     assert (stage / "b.py").read_text() == (ckpt / "b.py").read_text()
 
 
-def test_a_patch_stays_on_a_module_transformers_loads_again(monkeypatch, tmp_path):
+@pytest.mark.parametrize("load_again", ["forced", "another-path"])
+def test_a_patch_stays_on_a_module_transformers_loads_again(
+    monkeypatch, tmp_path, capsys, load_again
+):
     """transformers re-executes a remote module it loads again (when the files it hashes change, or
-    forced as here), rebinding the module's globals. The patch must be back on the module the class
-    is resolved from, which is the one from_pretrained builds from."""
+    forced), and loads a second copy under another name for another path to the same checkpoint;
+    either way the module's globals are fresh. The patch must be back on the module the class is
+    resolved from, which is the one from_pretrained builds from, and the re-patch is reported."""
     monkeypatch.setattr(dmu, "HF_MODULES_CACHE", str(tmp_path / "modules"))
     monkeypatch.setattr(dmu, "get_class_in_module", dmu.get_class_in_module)
     monkeypatch.setattr(_remote_code, "_KEPT_PATCHES", {})
@@ -100,18 +104,27 @@ def test_a_patch_stays_on_a_module_transformers_loads_again(monkeypatch, tmp_pat
     (ckpt / "modeling_kimi_k25.py").write_text(
         "class DeepseekV3ForCausalLM:\n    pass\n\n\nclass KimiK25ForConditionalGeneration:\n    pass\n"
     )
+    (tmp_path / "same_ckpt").symlink_to(ckpt)
     native = type("DeepseekV3ForCausalLM", (), {})
+
+    def to_native(module):
+        changed = module.DeepseekV3ForCausalLM is not native
+        module.DeepseekV3ForCausalLM = native
+        return changed
+
     ref = "modeling_kimi_k25.KimiK25ForConditionalGeneration"
     try:
         first = dmu.get_class_from_dynamic_module(ref, str(ckpt))
-        patched = keep_patched(
-            ".modeling_kimi_k25", lambda module: setattr(module, "DeepseekV3ForCausalLM", native)
-        )
-        again = dmu.get_class_from_dynamic_module(ref, str(ckpt), force_download=True)
+        patched = keep_patched(".modeling_kimi_k25", to_native)
+        if load_again == "forced":
+            again = dmu.get_class_from_dynamic_module(ref, str(ckpt), force_download=True)
+        else:
+            again = dmu.get_class_from_dynamic_module(ref, str(tmp_path / "same_ckpt"))
 
         assert patched == [first.__module__]
-        assert again is not first  # the module was executed again
+        assert again is not first  # a fresh module, not the one patched above
         assert sys.modules[again.__module__].DeepseekV3ForCausalLM is native
+        assert f"re-patched {again.__module__}" in capsys.readouterr().out
     finally:
         for name in set(sys.modules) - loaded:
             del sys.modules[name]

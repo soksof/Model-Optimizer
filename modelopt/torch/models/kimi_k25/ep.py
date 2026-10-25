@@ -134,8 +134,9 @@ def _patch_kimi_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -> N
     )
 
     def to_native(module):
-        if not hasattr(module, "DeepseekV3ForCausalLM"):
-            return
+        current = getattr(module, "DeepseekV3ForCausalLM", NativeDeepseekV3ForCausalLM)
+        if current is NativeDeepseekV3ForCausalLM:
+            return False
         module.DeepseekV3ForCausalLM = NativeDeepseekV3ForCausalLM
         # Like Kimi-VL's: the remote tie_weights() takes no kwargs, but transformers' post_init and
         # load call tie_weights(recompute_mapping=False) -> TypeError.
@@ -144,6 +145,7 @@ def _patch_kimi_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -> N
             own_tie = vars(kimi_cls).get("tie_weights")
             if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
                 kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
+        return True
 
     # The dynamic-module loader names the module like
     # ``transformers_modules.<short-repo>.<hash>.modeling_kimi_k25``. It stays patched when

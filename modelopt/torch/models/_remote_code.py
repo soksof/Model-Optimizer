@@ -71,10 +71,10 @@ def stage_full_remote_closure() -> None:
 
 
 # Patches keep_patched applies to remote modules, by module-name suffix.
-_KEPT_PATCHES: dict[str, Callable[[ModuleType], None]] = {}
+_KEPT_PATCHES: dict[str, Callable[[ModuleType], bool]] = {}
 
 
-def keep_patched(suffix: str, patch: Callable[[ModuleType], None]) -> list[str]:
+def keep_patched(suffix: str, patch: Callable[[ModuleType], bool]) -> list[str]:
     """Apply ``patch`` to every loaded remote module named ``*<suffix>``, and again whenever
     transformers resolves a class from one.
 
@@ -82,7 +82,8 @@ def keep_patched(suffix: str, patch: Callable[[ModuleType], None]) -> list[str]:
     afresh under another name for another path to the same checkpoint; either way the module's
     globals are rebound and a patch applied once is gone. Wrapping ``get_class_in_module`` re-applies
     the patch to the module a class is resolved from, so ``from_pretrained`` builds from the patched
-    module. Returns the names of the modules patched now. Idempotent per suffix.
+    module. ``patch`` returns whether it changed the module; a re-application that did is reported on
+    the rank it happened on. Returns the names of the modules patched now. Idempotent per suffix.
     """
     import transformers.dynamic_module_utils as dmu
 
@@ -93,8 +94,14 @@ def keep_patched(suffix: str, patch: Callable[[ModuleType], None]) -> list[str]:
         def _resolved(class_name, module_path, *args, **kwargs):
             cls = orig(class_name, module_path, *args, **kwargs)
             for kept_suffix, kept_patch in _KEPT_PATCHES.items():
-                if cls.__module__.endswith(kept_suffix):
-                    kept_patch(sys.modules[cls.__module__])
+                if cls.__module__.endswith(kept_suffix) and kept_patch(sys.modules[cls.__module__]):
+                    from modelopt.torch.utils import distributed as dist
+
+                    print(
+                        f"[rank {dist.rank()}] re-patched {cls.__module__}, which transformers loaded "
+                        "again after it was patched",
+                        flush=True,
+                    )
             return cls
 
         setattr(_resolved, "_modelopt_keep_patched", True)

@@ -147,8 +147,9 @@ def _patch_kimi_vl_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -
     )
 
     def to_native(module):
-        if not hasattr(module, "DeepseekV3ForCausalLM"):
-            return
+        current = getattr(module, "DeepseekV3ForCausalLM", NativeDeepseekV3ForCausalLM)
+        if current is NativeDeepseekV3ForCausalLM:
+            return False
         module.DeepseekV3ForCausalLM = NativeDeepseekV3ForCausalLM
         # transformers 5.9's init_weights calls self.tie_weights(recompute_mapping=False), but
         # Kimi-VL's remote tie_weights() has the older no-kwarg signature -> TypeError. Wrap it to
@@ -158,6 +159,7 @@ def _patch_kimi_vl_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -
             own_tie = vars(kimi_cls).get("tie_weights")
             if own_tie is not None and not getattr(own_tie, "_kimi_vl_kwargs_shim", False):
                 kimi_cls.tie_weights = _drop_tie_weights_kwargs(own_tie)
+        return True
 
     # Kept patched when from_pretrained resolves the class again, even from a re-executed module.
     patched = keep_patched(".modeling_kimi_vl", to_native)
