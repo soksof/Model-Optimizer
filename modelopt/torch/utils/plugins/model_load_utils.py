@@ -1417,18 +1417,20 @@ def _refuse_unquantizable_experts(expert_modules) -> None:
     fused-experts wrapper that quantizes on the eager forward only, like FP8's, is refused: the
     transport runs the grouped GEMM.
     """
-    transposed = sorted(
-        {type(m).__name__ for m in expert_modules if getattr(m, "is_transposed", False)}
+    from modelopt.torch.quantization.plugins.huggingface import (
+        _eager_only_experts,
+        _transposed_experts,
     )
+
+    # Quantization's own rules: it leaves transposed experts unquantized, and its torch_a2a check
+    # refuses eager-only ones. This refuses both at load.
+    transposed = _transposed_experts(expert_modules)
     if transposed:
         raise NotImplementedError(
             f"Expert-parallel PTQ cannot quantize {', '.join(transposed)}: these experts store their "
             "weights transposed, which the grouped quantization leaves unquantized. Quantize the "
             "model without expert parallelism."
         )
-    from modelopt.torch.quantization.plugins.huggingface import _eager_only_experts
-
-    # Quantization's own torch_a2a check refuses the same experts; this refuses them at load.
     wrapped = _eager_only_experts(expert_modules)
     if wrapped:
         raise NotImplementedError(

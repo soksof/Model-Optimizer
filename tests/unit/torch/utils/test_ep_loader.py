@@ -340,15 +340,23 @@ def test_routed_experts_under_a_fused_experts_wrapper(wrapper, outcome):
         QuantModuleRegistry.unregister(_Experts)
 
 
-def test_transposed_experts_are_refused():
+@pytest.mark.parametrize("layout", ["says-so", "by-its-shapes", "standard"])
+def test_transposed_experts_are_refused(layout):
     """The grouped quantization leaves experts stored transposed (GPT-OSS's) unquantized: the model
-    would be quantized everywhere but its experts."""
+    would be quantized everywhere but its experts. Quantization tells them by their flag or, for
+    gated experts that do not say so, by their shapes; so does the load."""
     model = _model_with_decoder_at("model.")
     experts = [layer.mlp.experts for layer in model.model.layers]
     for module in experts:
-        module.is_transposed = True
+        if layout == "says-so":
+            module.is_transposed = True
+        else:  # a fused-experts container: 4 experts, gate and up 2 x 2 wide, on hidden size 2
+            module.num_experts = 4
+            if layout == "by-its-shapes":  # (num_experts, in_dim, out_dim)
+                module.gate_up_proj = nn.Parameter(torch.zeros(4, 2, 4))
+    refused = pytest.raises(NotImplementedError, match="cannot quantize _Experts: these experts")
 
-    with pytest.raises(NotImplementedError, match="cannot quantize _Experts: these experts store"):
+    with refused if layout != "standard" else nullcontext():
         _refuse_unquantizable_experts(experts)
 
 
