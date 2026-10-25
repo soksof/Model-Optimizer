@@ -84,12 +84,25 @@ def remote(monkeypatch):
     return module
 
 
-def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkeypatch, remote):
+@pytest.mark.parametrize(
+    "quantization_config",
+    [
+        QUANT,
+        # Left to the expert-parallel load: bf16 experts load as they are, and block-fp8 ones are
+        # dequantized by the copy of quantization_config Kimi's config class keeps on the top level.
+        None,
+        {"quant_method": "fp8", "weight_block_size": [128, 128]},
+    ],
+    ids=["compressed-tensors", "bf16", "block-fp8"],
+)
+def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(
+    monkeypatch, remote, quantization_config
+):
     """The text config becomes transformers' own ``DeepseekV3Config`` (no remote ``auto_map``, no
     stale ``quantization_config``) with an EP plan for the fused experts, naming the experts the
-    spec states for a run that skips prepare; the decompressor is installed while the text config
-    it replaces still carries the compressed-tensors scheme; the remote-code staging shim is left
-    installed."""
+    spec states for a run that skips prepare; the decompressor is installed for compressed-tensors
+    experts only, while the text config it replaces still carries their scheme; the remote-code
+    staging shim is left installed."""
     installs = []
     monkeypatch.setattr(
         _onfly_decompress,
@@ -98,6 +111,7 @@ def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkey
     )
     staging = dmu.get_cached_module_file
     config = _vlm_config()
+    config.text_config.quantization_config = quantization_config
 
     assert kimi_k25.prepare(config, ckpt_path="/ckpt", trust_remote_code=True) is config
 
@@ -111,7 +125,7 @@ def test_prepare_rebuilds_the_language_model_config_as_native_deepseek_v3(monkey
     assert _routed_expert_keys(text.base_model_ep_plan) == _routed_expert_keys(
         get_spec("kimi_k25").ep_spec.prepared_ep_plan
     )
-    assert installs == [QUANT]
+    assert installs == ([QUANT] if quantization_config is QUANT else [])
     assert dmu.get_cached_module_file is not staging
 
 

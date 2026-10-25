@@ -61,7 +61,8 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     """Load Kimi-K2.5's language model as the transformers-native deepseek_v3.
 
     Swap text_config to native deepseek_v3 + monkey-patch Kimi's modeling to use the native
-    DeepseekV3ForCausalLM + apply the EP plan + install the on-the-fly expert decompressor.
+    DeepseekV3ForCausalLM + apply the EP plan + install the on-the-fly decompressor for
+    compressed-tensors experts.
     """
     if type(hf_config).__module__.startswith("transformers."):
         # From 5.13, a load without trust_remote_code builds transformers' own port, which the
@@ -89,8 +90,12 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
     #    deepseek_v3's per-expert WeightConverter (which fuses per-expert .weight tensors into the
     #    3-D gate_up_proj/down_proj Parameters). Format-agnostic; driven by checkpoint's
     #    quantization_config, which Kimi-K2.5 carries only on the text_config step 2 replaces. It
-    #    goes first, so a checkpoint it refuses leaves everything as it was.
-    _onfly_decompress.install_onfly_decompress(hf_config)
+    #    goes first, so a checkpoint it refuses leaves everything as it was. Experts stored
+    #    otherwise are the expert-parallel load's to read: bf16 as they are, block-fp8 by the copy
+    #    of quantization_config Kimi's config class keeps on the top-level config.
+    quantization_config = _onfly_decompress._find_quantization_config(hf_config) or {}
+    if quantization_config.get("quant_method") == "compressed-tensors":
+        _onfly_decompress.install_onfly_decompress(hf_config)
 
     # transformers stages only 1-hop relative imports; Kimi's remote code is 2 hops deep. Install the
     # full-closure staging shim BEFORE any remote-code load (this plugin's get_class_from_dynamic_module

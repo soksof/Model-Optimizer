@@ -121,7 +121,12 @@ def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool 
 
 
 def _drop_tie_weights_kwargs(orig_tie):
-    """Wrap a remote ``tie_weights()`` that predates the kwargs newer transformers pass to it."""
+    """Wrap a remote ``tie_weights()`` that predates the kwargs newer transformers pass to it.
+
+    Dropping ``missing_keys`` as well as ``recompute_mapping`` is safe because the remote
+    ``tie_weights`` only calls its language model's, and the Kimi checkpoints set
+    ``tie_word_embeddings=False``: nothing is tied, so no tied key is left to report to the load.
+    """
 
     def _tie_weights(self, *args, **kwargs):  # drop recompute_mapping etc.
         return orig_tie(self)
