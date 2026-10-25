@@ -614,11 +614,12 @@ def get_model(
     # detected : rank 1 and rank 0 both on CUDA device ...". Every load path below honours the pin.
     # A dense model too large to replicate per rank wants --use_fsdp2, not "auto" sharding: under
     # data-parallel calibration each rank must own its own GPU. A single process keeps "auto".
-    pinned = (
-        {"": str(device)}
-        if device != "cpu" and ":" in str(device) and plan.world_size > 1
-        else None
-    )
+    if plan.world_size > 1 and device != "cpu" and ":" not in str(device):
+        raise ValueError(
+            f"{plan!r} has each rank hold its own copy of the model on its own GPU, but "
+            f"device={device!r} names no GPU index; pass the rank's own GPU, cuda:<local_rank>."
+        )
+    pinned = {"": str(device)} if device != "cpu" and plan.world_size > 1 else None
     device_map = "cpu" if device == "cpu" else pinned or "auto"
 
     # Prepare config kwargs for loading

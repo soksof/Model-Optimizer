@@ -699,9 +699,10 @@ def mono_quantize(
         else:
             language_model = mtq.quantize(language_model, quant_cfg, forward_loop=calibrate_loop)
         if distribution_plan(full_model).is_expert_parallel:
-            # The calibration loop re-plants the a2a forwards quantizer insertion drops, but a
-            # config without static activation scales calibrates without it, and algorithm None
-            # (the MX formats) never calls it; the preview and the export forward through them.
+            # The calibration loop re-plants the a2a forwards quantizer insertion drops (on
+            # transformers >= 5.16; a no-op before), but a config without static activation scales
+            # calibrates without it, and algorithm None (the MX formats) never calls it; the
+            # preview and the export forward through them.
             _reinstall_a2a_forwards(full_model, expert_parallel_mesh(full_model))
 
         # For VL models, update full_model to use the quantized language model
@@ -1001,9 +1002,10 @@ def post_quantize(
                     **lockstep,
                 )
         except Exception as e:
-            if lockstep:
-                # A sharded model's ranks decode in lockstep: a rank that skipped the preview would
-                # leave the others blocked in the next step's collective. Raising aborts the run.
+            if distribution_plan(full_model).is_expert_parallel:
+                # The ranks decode in lockstep: a rank that skipped the preview would leave the
+                # others blocked in the next step's collective, so the run stops. --use_fsdp2 keeps
+                # main's skip, which still exports after a failure every rank meets at the same step.
                 raise RuntimeError(_PREVIEW_STOPS_THE_RUN) from e
             warnings.warn(f"Post-quantization generation sanity check failed, skipping it: {e}")
     elif is_nemotron_vl_model and tokenizer is not None:

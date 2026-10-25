@@ -430,18 +430,17 @@ def test_a_whole_model_loads_by_the_plan_through_get_model(hf_ptq, monkeypatch, 
     [
         ("cuda:1", 4, {"": "cuda:1"}),
         (torch.device("cuda:1"), 4, {"": "cuda:1"}),
-        ("cuda", 4, "auto"),
         ("cuda:1", 1, "auto"),
     ],
-    ids=["str", "torch_device", "unindexed", "single_process"],
+    ids=["str", "torch_device", "single_process"],
 )
 def test_a_rank_device_pins_the_whole_model_to_it(
     monkeypatch, tmp_path, device, world_size, device_map
 ):
     """Under torchrun each rank asks for its own cuda:<local_rank>; "auto" would let every rank's
-    accelerate pick the same idle GPU. An unindexed "cuda" still spreads the model over the GPUs,
-    and so does a single process, whatever device it names. Only a spread model is held to a memory
-    limit sized over the node's GPUs: the pinned map would ignore one."""
+    accelerate pick the same idle GPU. A single process spreads the model over the GPUs, whatever
+    device it names. Only a spread model is held to a memory limit sized over the node's GPUs: the
+    pinned map would ignore one."""
     LlamaConfig(architectures=["LlamaForCausalLM"], **_TINY).save_pretrained(tmp_path)
     # No GPU on the node holds the model, so sizing it over the node limits its memory.
     monkeypatch.setattr(example_utils, "get_max_memory", lambda: {0: 0, "cpu": 1 << 40})
@@ -493,15 +492,23 @@ def test_every_load_path_keeps_the_rank_pin(monkeypatch, tmp_path, checkpoint):
     assert placed == [{"": "cuda:1"}]
 
 
-def test_a_sequential_map_is_refused_where_each_rank_holds_its_own_copy(tmp_path):
+@pytest.mark.parametrize(
+    ("device", "kwargs", "match"),
+    [
+        ("cuda:1", {"use_seq_device_map": True}, "--use_seq_device_map"),
+        # "auto" would let every rank's accelerate pick the same idle GPU.
+        ("cuda", {}, "names no GPU"),
+    ],
+    ids=["sequential_map", "unindexed_device"],
+)
+def test_a_placement_over_shared_gpus_is_refused_where_each_rank_holds_its_own_copy(
+    tmp_path, device, kwargs, match
+):
     LlamaConfig(architectures=["LlamaForCausalLM"], **_TINY).save_pretrained(tmp_path)
 
-    with pytest.raises(ValueError, match="--use_seq_device_map"):
+    with pytest.raises(ValueError, match=match):
         example_utils.get_model(
-            str(tmp_path),
-            device="cuda:1",
-            distribution=DistributionPlan(4),
-            use_seq_device_map=True,
+            str(tmp_path), device=device, distribution=DistributionPlan(4), **kwargs
         )
 
 
@@ -825,17 +832,19 @@ def test_the_offline_specdec_loader_is_split_across_ranks_too(hf_ptq):
     ("plan", "nemotron_vl", "raises"),
     [
         (DistributionPlan(4), False, False),
+        (DistributionPlan(4, dense="fsdp"), False, False),
         (DistributionPlan(4, ep_size=4), False, True),
         (DistributionPlan(4, ep_size=4), True, True),
     ],
-    ids=["replicated", "expert_parallel", "expert_parallel_nemotron_vl"],
+    ids=["replicated", "fsdp2", "expert_parallel", "expert_parallel_nemotron_vl"],
 )
-def test_a_failed_preview_of_a_sharded_model_stops_the_run(
+def test_a_failed_preview_of_an_expert_parallel_model_stops_the_run(
     hf_ptq, monkeypatch, plan, nemotron_vl, raises
 ):
-    """A rank that skipped a sharded model's preview would leave the others decoding in lockstep,
-    blocked in the next step's collective, so the failure is raised, which aborts the run, with the
-    preview's error as its cause. A model every rank holds whole keeps the best-effort skip."""
+    """A rank that skipped an expert-parallel model's preview would leave the others decoding in
+    lockstep, blocked in the next step's collective, so the failure is raised, which aborts the run,
+    with the preview's error as its cause. A model every rank holds whole keeps the best-effort
+    skip and exports, and so does --use_fsdp2, as on main."""
 
     def fail(*args, **kwargs):
         raise RuntimeError("the preview failed on this rank")
@@ -845,7 +854,8 @@ def test_a_failed_preview_of_a_sharded_model_stops_the_run(
 
     model = _FailingModel()
     set_distribution_plan(model, plan)
-    monkeypatch.setattr(hf_ptq, "export_quantized", lambda *args, **kwargs: None)
+    exported = []
+    monkeypatch.setattr(hf_ptq, "export_quantized", lambda *args, **kwargs: exported.append(True))
     monkeypatch.setattr(hf_ptq, "run_nemotron_vl_preview", fail)  # as vlm_utils raises in lockstep
     ids = torch.zeros(1, 4, dtype=torch.long)
     args = SimpleNamespace(
@@ -866,6 +876,7 @@ def test_a_failed_preview_of_a_sharded_model_stops_the_run(
     else:
         with pytest.warns(UserWarning, match="sanity check failed"):
             run()
+    assert exported == ([] if raises else [True])
 
 
 @pytest.mark.parametrize(("lockstep", "raises"), [({}, False), ({"synced_gpus": True}, True)])
