@@ -37,6 +37,7 @@ Changelog
 
 **Backward Breaking Changes**
 
+- ``examples/hf_ptq/hf_ptq.py`` launched by ``torchrun`` on more than one rank now refuses a ``--device`` other than ``cuda``, which it used to ignore: each rank runs on its own GPU, ``cuda:<local_rank>``.
 - ``examples/hf_ptq/hf_ptq.py --use_fsdp2`` on more than one GPU now refuses calibration that keeps its statistics on each rank: AWQ, SVDQuant, local Hessian and imatrix, also as an AutoQuantize candidate. Each rank calibrates on its own share of the data, so these calibrated the ranks' shards of a weight differently; run them without ``--use_fsdp2``.
 - ``export_mcore_gpt_to_hf`` given a Hugging Face Hub model ID no longer writes the tokenizer, processor, generation config or remote-code files. Pass a local directory instead, e.g. from ``modelopt.torch.export.ensure_local_checkpoint``.
 - Diffusion HF exports now omit attention quantizer buffers by default, except for FLUX.1, which retains enabled Q/K/V ``_amax`` keys for runtime compatibility; other consumers of those keys can opt in with ``export_attention_quantizers=True`` (CLI: ``--extra-param export_attention_quantizers=true``). Disabled attention quantizers remain excluded, and diffusion components, including LTX-2, no longer emit KV-cache quantization metadata.
