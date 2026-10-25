@@ -22,8 +22,10 @@ not the VLM root. transformers aggregates each sub-model's plan up to the root W
 prefix, so a plan on ``llm_config`` surfaces as ``language_model.<base>.layers.*`` and matches the
 real parameter paths -- while a plan on the top config reaches no expert at all.
 
-Only that plan is registered under the root type: the MoE and export sections stay NemotronH's,
-so lookups by ``nemotron_h_omni`` find neither yet. Sharing them is left to a follow-up.
+Only that plan is registered under the root type, so lookups of the MoE and export sections by
+``nemotron_h_omni`` find neither. No export depends on them: on transformers 5 the language
+model's experts are one fused container, which the export writes through its own handler, and
+every step those lookups gate leaves a fused container as it is.
 """
 
 from ..nemotron_h.specs import BASE_MODEL_EP_PLAN

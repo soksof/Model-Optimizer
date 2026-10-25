@@ -1429,22 +1429,25 @@ def _decide_distribution(
             f"The dense part of {hf_config.model_type} cannot be sharded {unshardable}.{remedy}"
         )
     if ep_size == 1 and dense == "replicate" and experts:
-        fsdp2 = "(--use_fsdp2 in examples/hf_ptq/hf_ptq.py, or MODELOPT_FSDP_SIZE=world)"
+        # The ways out besides sharding the experts, which a spec refusing EP rules out.
+        others = (
+            "shard the whole model with FSDP2 (--use_fsdp2 in examples/hf_ptq/hf_ptq.py, or "
+            "MODELOPT_FSDP_SIZE=world) if the checkpoint is unquantized, load it in a single "
+            "process, or replicate it on every rank outright with load_pretrained(..., "
+            f"distribution=DistributionPlan({world_size}, 1, 'replicate'))."
+        )
         ep = _ep_spec(hf_config.model_type)
         if ep is not None and ep.unsupported:
-            # Its spec refuses an EP degree above 1, so FSDP2 is the one way left to shard it.
             raise RuntimeError(
                 f"{hf_config.model_type} cannot be quantized expert-parallel yet, and the plan "
                 f"replicates it at world_size={world_size}, so every rank would hold the whole "
-                f"MoE. Shard the whole model with FSDP2 instead {fsdp2}."
+                f"MoE. Instead, {others}"
             )
         raise RuntimeError(
             f"{hf_config.model_type} can be expert-parallel, but the plan resolved to ep_size=1 at "
             f"world_size={world_size}, so every rank would hold the whole MoE. Shard its experts "
             f"(MODELOPT_EP_DEGREE above 1, dividing both its {num_experts} experts and the world "
-            f"size), shard the whole model with FSDP2 {fsdp2} if the checkpoint is unquantized, "
-            "load it in a single process, or replicate it on every rank outright with "
-            f"load_pretrained(..., distribution=DistributionPlan({world_size}, 1, 'replicate'))."
+            f"size), {others}"
         )
     return DistributionPlan(world_size, ep_size, dense)
 

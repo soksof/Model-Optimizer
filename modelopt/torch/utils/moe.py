@@ -53,6 +53,11 @@ def require_transformers(min_version: str, feature: str) -> None:
         )
 
 
+# The nested configs a VLM's expert-parallel plan and expert count are read from. A spec attaching
+# its plan anywhere else would be read as having none, and the MoE planned as a dense model.
+_SUB_CONFIG_ATTRS = ("text_config", "llm_config")
+
+
 def _ep_config(hf_config):
     """Return the config that carries the EP plan / expert count.
 
@@ -62,7 +67,7 @@ def _ep_config(hf_config):
     """
     if getattr(hf_config, "base_model_ep_plan", None):
         return hf_config
-    for _attr in ("text_config", "llm_config"):
+    for _attr in _SUB_CONFIG_ATTRS:
         sub = getattr(hf_config, _attr, None)
         if sub is not None and getattr(sub, "base_model_ep_plan", None):
             return sub
@@ -76,11 +81,7 @@ def _num_experts_from_config(hf_config) -> int:
     Recurses into ``.text_config`` / ``.llm_config`` so VLMs whose nested text submodel is the MoE
     (Kimi-K2.7, Llama-4 multimodal, NemotronH-Omni, ...) report the LM's expert count.
     """
-    for cfg in (
-        hf_config,
-        getattr(hf_config, "text_config", None),
-        getattr(hf_config, "llm_config", None),
-    ):
+    for cfg in (hf_config, *(getattr(hf_config, attr, None) for attr in _SUB_CONFIG_ATTRS)):
         if cfg is None:
             continue
         for attr in ("num_experts", "num_local_experts", "n_routed_experts", "num_routed_experts"):
@@ -205,6 +206,12 @@ def apply_distributed_support(
     if ep.base_model_ep_plan:
         target = hf_config
         if ep.plan_config_attr:
+            if ep.plan_config_attr not in _SUB_CONFIG_ATTRS:
+                raise ValueError(
+                    f"{model_type}'s spec attaches its expert-parallel plan to "
+                    f"config.{ep.plan_config_attr}, where the expert-parallel load does not read "
+                    f"one; it reads config.{' and config.'.join(_SUB_CONFIG_ATTRS)}."
+                )
             target = getattr(hf_config, ep.plan_config_attr, None)
             if target is None:
                 raise ValueError(

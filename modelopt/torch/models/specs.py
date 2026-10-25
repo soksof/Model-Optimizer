@@ -197,7 +197,8 @@ class EPSpec(SpecSection):
 
     plan_config_attr: str | None = None
     """The nested config attribute carrying the expert-parallel plan, for a VLM whose MoE is
-    its text sub-model (``"text_config"``, ``"llm_config"``). ``None`` means the root config.
+    its text sub-model: ``"text_config"`` or ``"llm_config"``, the two the expert-parallel load
+    reads a plan from. ``None`` means the root config.
 
     The plan has to sit on whichever config describes the module tree the globs are written
     against, so a plan on the wrong config silently matches nothing."""

@@ -103,6 +103,26 @@ def test_a_missing_nested_config_is_an_error_not_a_silent_skip():
         apply_distributed_support("nemotron_h_omni", cfg())
 
 
+def test_a_plan_attached_where_the_load_does_not_read_one_is_an_error(monkeypatch):
+    """The load reads a VLM's plan off text_config or llm_config: attached anywhere else, it would
+    be read as no plan at all, and the MoE planned as a dense model."""
+    spec = ModelSpec(
+        model_type="_probe",
+        ep_spec=EPSpec(
+            base_model_ep_plan={"layers.*.experts": "grouped_gemm"},
+            plan_config_attr="language_config",
+        ),
+    )
+    monkeypatch.setattr(
+        "modelopt.torch.models.get_spec", lambda mt: spec if mt == "_probe" else None
+    )
+    config = cfg(language_config=cfg())
+
+    with pytest.raises(ValueError, match="language_config, where the expert-parallel load"):
+        apply_distributed_support("_probe", config)
+    assert vars(config.language_config) == {}
+
+
 @pytest.mark.parametrize("model_type", ["gpt_oss", "llama4", "llama4_text"])
 def test_an_unsupported_model_is_refused_with_its_config_untouched(model_type):
     """These ship plans of their own, so only their spec's refusal keeps them off the

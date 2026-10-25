@@ -458,7 +458,11 @@ def test_a_run_without_expert_parallelism_needs_no_spec(run_as, serve, monkeypat
 
 # The refusals of an MoE left whole on every rank, by whether its spec allows expert parallelism.
 _CAN_BE_EP = "can be expert-parallel, but the plan resolved .* dividing both its {} experts"
-_NO_EP_YET = "cannot be quantized expert-parallel yet, and the plan replicates"
+_NO_EP_YET = (
+    "cannot be quantized expert-parallel yet, and the plan replicates .* FSDP2 .* if the "
+    "checkpoint is unquantized, load it in a single process, or replicate "
+    r".*DistributionPlan\(2, 1, 'replicate'\)"
+)
 
 
 @pytest.mark.parametrize(
@@ -489,8 +493,9 @@ def test_an_ep_capable_moe_left_whole_on_every_rank_is_an_error(
     degree of 1 skips (DeepSeek-V3). With nothing sharded either, every rank would hold the whole
     MoE: that must fail, not run, and name the expert count an EP degree has to divide. GPT-OSS
     carries a plan too, but its spec refuses expert parallelism, so auto picks no EP degree for it
-    and this check refuses it as an MoE that cannot be expert-parallel yet; the spec's own refusal,
-    a NotImplementedError and so a RuntimeError too, words it differently."""
+    and this check refuses it as an MoE that cannot be expert-parallel yet, offering every other
+    way out (FSDP2 only for an unquantized checkpoint); the spec's own refusal, a
+    NotImplementedError and so a RuntimeError too, words it differently."""
     if ep_degree is not None:
         if config.model_type == "qwen3_moe" and Version(transformers.__version__) < Version("5.7"):
             pytest.skip("qwen3_moe's base_model_ep_plan ships in transformers 5.7")
