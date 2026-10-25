@@ -804,6 +804,13 @@ def export_quantized(
         # Early exit for speculative decoding checkpoints
         # No tokenizer saving needed for spec ckpts
         if has_spec_opt(full_model):
+            if plan.is_fsdp_dense or plan.is_expert_parallel:
+                # export_speculative_decoding writes the whole checkpoint from one process and
+                # knows no plan: each rank of a sharded model would write it over the others.
+                raise NotImplementedError(
+                    f"Exporting a speculative-decoding model sharded as {plan!r} is not "
+                    "supported; quantize it in a single process."
+                )
             export_speculative_decoding(full_model, export_dir=export_path)
             args.checkpoint_exported = True
             print(f"Quantized speculative decoding checkpoint exported to: {export_path}")

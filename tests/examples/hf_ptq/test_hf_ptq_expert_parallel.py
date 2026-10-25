@@ -1113,3 +1113,23 @@ def test_only_rank_0_writes_a_replicated_model(hf_ptq, monkeypatch, plan, rank, 
     hf_ptq.export_quantized(args, model, model, "qwen3_moe")
 
     assert written == ["config"] * (rank == 0) + ["checkpoint"] * exports
+
+
+@pytest.mark.parametrize(
+    "plan", [DistributionPlan(4, dense="fsdp"), DistributionPlan(4, ep_size=4)], ids=["fsdp2", "ep"]
+)
+def test_a_sharded_speculative_decoding_model_is_refused_at_export(hf_ptq, monkeypatch, plan):
+    """The speculative-decoding exporter writes the whole checkpoint from one process and has no
+    rank gate, so every rank of a sharded model would write it over the others: it is refused on
+    every rank instead."""
+    written = []
+    monkeypatch.setattr(hf_ptq, "has_spec_opt", lambda model: True)
+    monkeypatch.setattr(
+        hf_ptq, "export_speculative_decoding", lambda model, export_dir: written.append(export_dir)
+    )
+    args = SimpleNamespace(dist_state=_dist_state(plan.world_size, 1), export_path="/export")
+
+    model = _PreviewModel(plan)
+    with pytest.raises(NotImplementedError, match="speculative-decoding model sharded"):
+        hf_ptq.export_quantized(args, model, model, "qwen3_moe")
+    assert written == []
