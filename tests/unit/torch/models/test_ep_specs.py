@@ -126,10 +126,11 @@ def test_a_plan_attached_where_the_load_does_not_read_one_is_an_error(monkeypatc
 @pytest.mark.parametrize("model_type", ["gpt_oss", "llama4", "llama4_text"])
 def test_an_unsupported_model_is_refused_with_its_config_untouched(model_type):
     """These ship plans of their own, so only their spec's refusal keeps them off the
-    expert-parallel path."""
+    expert-parallel path. The refusal names a single process first: FSDP2 loads only an
+    unquantized causal LM."""
     config = cfg()
 
-    with pytest.raises(NotImplementedError, match="cannot be quantized expert-parallel yet"):
+    with pytest.raises(NotImplementedError, match=r"yet: .* in a single process, or FSDP2-sharded"):
         apply_distributed_support(model_type, config)
     assert vars(config) == {}
 

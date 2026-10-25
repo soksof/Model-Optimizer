@@ -460,7 +460,7 @@ def test_a_run_without_expert_parallelism_needs_no_spec(run_as, serve, monkeypat
 _CAN_BE_EP = "can be expert-parallel, but the plan resolved .* dividing both its {} experts"
 _NO_EP_YET = (
     "cannot be quantized expert-parallel yet, and the plan replicates .* FSDP2 .* if the "
-    "checkpoint is unquantized, load it in a single process, or replicate "
+    "checkpoint is an unquantized causal LM, load it in a single process, or replicate "
     r".*DistributionPlan\(2, 1, 'replicate'\)"
 )
 
@@ -494,7 +494,7 @@ def test_an_ep_capable_moe_left_whole_on_every_rank_is_an_error(
     MoE: that must fail, not run, and name the expert count an EP degree has to divide. GPT-OSS
     carries a plan too, but its spec refuses expert parallelism, so auto picks no EP degree for it
     and this check refuses it as an MoE that cannot be expert-parallel yet, offering every other
-    way out (FSDP2 only for an unquantized checkpoint); the spec's own refusal, a
+    way out (FSDP2 only for an unquantized causal LM); the spec's own refusal, a
     NotImplementedError and so a RuntimeError too, words it differently."""
     if ep_degree is not None:
         if config.model_type == "qwen3_moe" and Version(transformers.__version__) < Version("5.7"):
