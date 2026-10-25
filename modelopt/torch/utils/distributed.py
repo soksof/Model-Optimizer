@@ -715,7 +715,8 @@ def fsdp2_wrap(model, shard_root=True, mp_policy=None, cpu_offload: bool = False
     """FSDP2-shard a HF causal LM's decoder layers, and the root unless ``shard_root=False``.
 
     It loads a model, so it lives with the loaders now:
-    :func:`modelopt.torch.utils.plugins.model_load_utils.fsdp2_wrap`. This keeps the old path.
+    :func:`modelopt.torch.utils.plugins.model_load_utils.fsdp2_wrap`. This keeps the old path, which
+    now needs the ``hf`` extra, as the loaders do.
     """
     from modelopt.torch.utils.plugins.model_load_utils import fsdp2_wrap as wrap
 
