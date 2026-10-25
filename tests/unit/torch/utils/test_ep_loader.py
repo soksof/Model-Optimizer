@@ -249,6 +249,82 @@ def test_a_plan_whose_expert_containers_match_no_module_is_refused(ep_world_of_t
         load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
 
 
+def test_routed_experts_without_experts_in_their_names_are_refused(ep_world_of_two, monkeypatch):
+    """Calibration tells routed experts by an ``experts`` in their names, and reduces the weight amax
+    of any other module over the expert-parallel group, merging the scales of different experts."""
+    model = _model_with_decoder_at("model.")
+    for layer in model.model.layers:
+        layer.mlp.routed = _Experts()
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            return model
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+    monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
+    config = SimpleNamespace(
+        base_model_ep_plan={"layers.*.mlp.routed": "moe_tp_experts"}, num_experts=4
+    )
+
+    with pytest.raises(
+        NotImplementedError, match=r"2 routed-expert .*model\.layers\.0\.mlp\.routed:"
+    ):
+        load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+
+
+@pytest.mark.parametrize("loaded", [4, 3, None], ids=["dividing", "not-dividing", "not-shown"])
+def test_an_expert_count_the_config_does_not_name_is_read_off_the_loaded_experts(
+    ep_world_of_two, gloo_world_of_one, monkeypatch, loaded
+):
+    """A config that names its expert count none of the ways the loader reads is checked against the
+    loaded experts' weights: transformers keeps the whole count on the DTensors it shards them into,
+    and 5.16.0 splits a count ep_size does not divide without an error. A count neither shows is
+    refused, as the distribution plan's decision refuses it."""
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    class _PastError(Exception):
+        """Raised by the load's next check: the experts' count passed."""
+
+    model = _model_with_decoder_at("model.")
+    if loaded is not None:
+        mesh = init_device_mesh("cpu", (1,))
+        for layer in model.model.layers:
+            experts = layer.mlp.experts
+            for name, param in list(experts.named_parameters(recurse=False)):
+                whole = torch.zeros(loaded, *param.shape[1:])
+                setattr(experts, name, nn.Parameter(distribute_tensor(whole, mesh, [Shard(0)])))
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            return model
+
+    def next_check(experts):
+        raise _PastError
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
+    )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+    monkeypatch.setattr(model_load_utils, "record_unplaced_source_keys", lambda *args: None)
+    monkeypatch.setattr(model_load_utils, "_refuse_unquantizable_experts", next_check)
+    config = SimpleNamespace(base_model_ep_plan=_EP_PLAN)
+    shown = r"\[3\]" if loaded == 3 else "none"
+    outcome = (
+        pytest.raises(_PastError)
+        if loaded == 4
+        else pytest.raises(ValueError, match=f"weights show {shown}")
+    )
+
+    with outcome:
+        load_and_prepare_ep("org/model", DistributionPlan(2, ep_size=2), hf_config=config)
+
+
 def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of_two, monkeypatch):
     """The checkpoint's ``dtype`` reaches ``from_pretrained``, and the class that builds it is chosen
     with the trust the caller gave its code."""

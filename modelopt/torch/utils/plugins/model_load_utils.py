@@ -1620,7 +1620,8 @@ def load_and_prepare_ep(
             "or grouped_gemm), so this load would leave them whole on every rank."
         )
     # The all-to-all transport finds an expert's rank by dividing its id by this rank's share of
-    # the experts, which holds only when every rank holds as many.
+    # the experts, which holds only when every rank holds as many. A count the config names none of
+    # the ways this reads is checked once the experts load, from their weights.
     num_experts = _num_experts_from_config(hf_config)
     if num_experts % ep_degree:
         raise ValueError(
@@ -1765,6 +1766,35 @@ def load_and_prepare_ep(
             f"{type(model).__name__} matches, so calibration would reduce the experts' amax over "
             "ranks holding different experts. Quantize the model without expert parallelism."
         )
+    # Calibration tells routed experts by their names, and reduces any other module's weight amax
+    # over the expert-parallel group, which would merge the scales of different experts.
+    from modelopt.torch.quantization.model_calib import _is_routed_expert
+
+    unnamed = [name for name in expert_modules if not _is_routed_expert(name)]
+    if unnamed:
+        raise NotImplementedError(
+            f"Expert-parallel PTQ cannot calibrate {len(unnamed)} routed-expert container(s), e.g. "
+            f"{unnamed[0]}: calibration tells routed experts by an 'experts' in their names, so it "
+            "would merge their weight scales over ranks holding different experts. Quantize the "
+            "model without expert parallelism."
+        )
+    if not num_experts:
+        # The config names no count for the check before the load: the experts' weights carry it
+        # whole as DTensors (transformers 5.16 on; 5.16.0 splits an uneven count without an error).
+        # A count they do not show either is refused, as the distribution plan's decision refuses
+        # a count it cannot read.
+        counts = {
+            param.shape[0]
+            for module in expert_modules.values()
+            for param in module.parameters(recurse=False)
+            if isinstance(param, DTensor)
+        }
+        if not counts or any(count % ep_degree for count in counts):
+            raise ValueError(
+                f"{plan!r}: ep_size={ep_degree} must divide the routed experts, which the all-to-all "
+                "transport shares out equally over the expert-parallel ranks; the config names no "
+                f"count, and the loaded experts' weights show {sorted(counts) or 'none'}."
+            )
     _refuse_unquantizable_experts(expert_modules.values())
 
     # Each module's ParallelState for calibration's amax sync: dense modules reduce over the whole world;
