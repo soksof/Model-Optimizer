@@ -380,6 +380,23 @@ def _resolve_distribution(args: argparse.Namespace):
             "across ranks, so ranks could choose different formats per layer; launch hf_ptq "
             "without torchrun for an AutoQuantize recipe."
         )
+    if plan.world_size > 1 and not args.use_fsdp2:
+        # These configure loading one model in a single process: compressed as it loads, or
+        # spread over the node's GPUs, CPU and disk. An expert-parallel run never reaches those
+        # loaders, and a replicated one pins each rank's copy to the rank's GPU, which none of them
+        # works with. Refused before the load rather than ignored. --max_cpu_memory_gb and
+        # --max_gpu_memory_gb come only with --offload_folder.
+        for flag, given in (
+            ("--low_memory_mode", args.low_memory_mode),
+            ("--use_seq_device_map", args.use_seq_device_map),
+            ("--offload_folder", args.offload_folder is not None),
+        ):
+            if given:
+                raise NotImplementedError(
+                    f"{plan!r}: {flag} configures loading one model in a single process, but each "
+                    "rank of this run loads its own share or copy of it onto its own GPU. Drop it, "
+                    "or launch hf_ptq without torchrun to use it."
+                )
     return plan, hf_config
 
 

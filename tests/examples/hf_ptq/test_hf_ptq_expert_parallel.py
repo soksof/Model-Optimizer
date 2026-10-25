@@ -139,6 +139,9 @@ def _args(dist_state, **overrides):
         attn_implementation=None,
         sparsity_fmt="dense",
         qformat="fp8",
+        low_memory_mode=False,
+        use_seq_device_map=False,
+        offload_folder=None,
     )
     vars(args).update(overrides)
     return args
@@ -263,6 +266,37 @@ def test_an_auto_quantize_recipe_is_refused_on_the_routes_this_script_adds(
             hf_ptq._resolve_distribution(args)
 
 
+@pytest.mark.parametrize(
+    "option",
+    [{"low_memory_mode": True}, {"use_seq_device_map": True}, {"offload_folder": "/offload"}],
+    ids=["low_memory_mode", "use_seq_device_map", "offload_folder"],
+)
+@pytest.mark.parametrize(
+    ("make_config", "world_size"),
+    [
+        (lambda: _deepseek_v3(n_routed_experts=8), 2),
+        (lambda: LlamaConfig(**_TINY), 2),
+        (lambda: LlamaConfig(**_TINY), 1),
+    ],
+    ids=["expert_parallel", "replicated", "single_process"],
+)
+def test_the_single_process_load_options_are_refused_on_the_routes_this_script_adds(
+    hf_ptq, monkeypatch, torchrun, make_config, world_size, option
+):
+    """Each rank of an expert-parallel or replicated run loads its own share or copy of the model
+    onto its own GPU, where these options of a single process's load would be ignored or would break
+    the load. Both routes refuse them before the load; a single process loads by them as before."""
+    _serve(monkeypatch, hf_ptq, make_config())
+    args = _args(torchrun(world_size=world_size), **option)
+
+    if world_size == 1:
+        assert hf_ptq._resolve_distribution(args)[0] == DistributionPlan(1)
+    else:
+        (name,) = option
+        with pytest.raises(NotImplementedError, match=f"--{name}"):
+            hf_ptq._resolve_distribution(args)
+
+
 # ---------------------------------------------------------------------------------- load_model
 
 
@@ -379,22 +413,25 @@ def test_a_rank_device_pins_the_whole_model_to_it(
 ):
     """Under torchrun each rank asks for its own cuda:<local_rank>; "auto" would let every rank's
     accelerate pick the same idle GPU. An unindexed "cuda" still spreads the model over the GPUs,
-    and so does a single process, whatever device it names."""
+    and so does a single process, whatever device it names. Only a spread model is held to a memory
+    limit sized over the node's GPUs: the pinned map would ignore one."""
     LlamaConfig(architectures=["LlamaForCausalLM"], **_TINY).save_pretrained(tmp_path)
+    # No GPU on the node holds the model, so sizing it over the node limits its memory.
+    monkeypatch.setattr(example_utils, "get_max_memory", lambda: {0: 0, "cpu": 1 << 40})
     placed = []
 
     plan = DistributionPlan(world_size)
 
     def load_pretrained(ckpt_path, auto_class, **kwargs):
         assert kwargs["distribution"] == plan
-        placed.append(kwargs["device_map"])
+        placed.append((kwargs["device_map"], "max_memory" in kwargs))
         return torch.nn.Linear(1, 1)
 
     monkeypatch.setattr(example_utils, "load_pretrained", load_pretrained)
 
     example_utils.get_model(str(tmp_path), device=device, distribution=plan)
 
-    assert placed == [device_map]
+    assert placed == [(device_map, device_map == "auto")]
 
 
 @pytest.mark.parametrize(

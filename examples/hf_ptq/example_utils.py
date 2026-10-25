@@ -832,7 +832,9 @@ def get_model(
                 f"Offload folder: {offload_folder}\n"
                 "Weights exceeding GPU+CPU budgets will be streamed from disk."
             )
-        else:
+        elif not pinned:
+            # A pinned copy goes onto its rank's GPU whole, by a map that ignores max_memory: sizing
+            # it over the node's GPUs would print a limit the load does not apply.
             inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
             if "cpu" in inferred_device_map.values():
                 for _device in max_memory:
