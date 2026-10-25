@@ -44,8 +44,9 @@ child-module plans up to the root with name prefix, so the final root ``_ep_plan
 ``language_model.model.layers.*.mlp.experts.{gate_up_proj,down_proj,...}`` -- matching the actual
 parameter paths in the loaded VLM.
 
-Version floor: transformers >= 5.8, which the on-the-fly decompressor enforces: earlier releases'
-``Concatenate`` trips over the sibling keys it has already consumed. The decompressor couples tightly to
+Version floor: transformers >= 5.8, which the spec declares. The on-the-fly decompressor, installed
+for a compressed-tensors checkpoint, needs it: earlier releases' ``Concatenate`` trips over the
+sibling keys it has already consumed. The decompressor couples tightly to
 transformers' still-evolving ``WeightConverter`` conversion-ops API.
 """
 
