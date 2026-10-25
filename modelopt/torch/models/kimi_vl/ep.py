@@ -45,6 +45,7 @@ stand in for the symbols the remote code imports that later releases dropped.
 
 import sys
 
+from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.moe import apply_distributed_support
 
 from .. import _onfly_decompress
@@ -63,14 +64,14 @@ def _install_compat_import_shims():
         if not hasattr(iu, "is_torch_fx_available"):
             iu.is_torch_fx_available = lambda: False
     except Exception as e:
-        print(f"[kimi_vl] compat-shim warning (import_utils): {type(e).__name__}: {e}", flush=True)
+        print_rank_0(f"[kimi] compat-shim warning (import_utils): {type(e).__name__}: {e}")
     try:
         import transformers.pytorch_utils as pu
 
         if not hasattr(pu, "is_torch_greater_or_equal_than_1_13"):
             pu.is_torch_greater_or_equal_than_1_13 = True
     except Exception as e:
-        print(f"[kimi_vl] compat-shim warning (pytorch_utils): {type(e).__name__}: {e}", flush=True)
+        print_rank_0(f"[kimi] compat-shim warning (pytorch_utils): {type(e).__name__}: {e}")
     try:
         import transformers.modeling_attn_mask_utils as amu
 
@@ -78,15 +79,13 @@ def _install_compat_import_shims():
 
             def _prepare_4d_causal_attention_mask(*args, **kwargs):  # pragma: no cover
                 raise RuntimeError(
-                    "kimi_vl: remote _prepare_4d_causal_attention_mask stub called -- the native LM "
+                    "kimi: remote _prepare_4d_causal_attention_mask stub called -- the native LM "
                     "builds its own mask, so this path should be unreachable."
                 )
 
             amu._prepare_4d_causal_attention_mask = _prepare_4d_causal_attention_mask
     except Exception as e:
-        print(
-            f"[kimi_vl] compat-shim warning (attn_mask_utils): {type(e).__name__}: {e}", flush=True
-        )
+        print_rank_0(f"[kimi] compat-shim warning (attn_mask_utils): {type(e).__name__}: {e}")
 
 
 def prepare(hf_config, *, ckpt_path: str | None = None, trust_remote_code: bool = False, **_):
@@ -168,8 +167,7 @@ def _patch_kimi_vl_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -
         raise RuntimeError(
             "kimi_vl: could not find a loaded modeling_kimi_vl in sys.modules to monkey-patch"
         )
-    print(
+    print_rank_0(
         f"[kimi_vl] monkey-patched DeepseekV3ForCausalLM -> transformers-native (+tie_weights shim) in: "
-        f"{patched}",
-        flush=True,
+        f"{patched}"
     )

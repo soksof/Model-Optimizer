@@ -169,5 +169,5 @@ def test_prepare_refuses_transformers_own_port():
     """From 5.13 a load without ``trust_remote_code`` builds transformers' port, which the patch
     never reaches; ``prepare`` must refuse it rather than run unpatched."""
     native = pytest.importorskip("transformers.models.kimi_k25.configuration_kimi_k25")
-    with pytest.raises(ValueError, match="trust_remote_code=True"):
-        kimi_k25.prepare(native.Kimi_K25Config(), ckpt_path="/ckpt")
+    with pytest.raises(ValueError, match="runs on the checkpoint's own modeling code"):
+        kimi_k25.prepare(native.Kimi_K25Config(), ckpt_path="/ckpt", trust_remote_code=True)

@@ -51,6 +51,7 @@ transformers' still-evolving ``WeightConverter`` conversion-ops API.
 
 import sys
 
+from modelopt.torch.utils import print_rank_0
 from modelopt.torch.utils.moe import apply_distributed_support
 
 from .. import _onfly_decompress
@@ -154,7 +155,6 @@ def _patch_kimi_modeling_to_native(ckpt_path: str, trust_remote_code: bool) -> N
         raise RuntimeError(
             "kimi_k25: could not find a loaded modeling_kimi_k25 in sys.modules to monkey-patch"
         )
-    print(
-        f"[kimi_k25] monkey-patched DeepseekV3ForCausalLM -> transformers-native in: {patched}",
-        flush=True,
+    print_rank_0(
+        f"[kimi_k25] monkey-patched DeepseekV3ForCausalLM -> transformers-native in: {patched}"
     )
