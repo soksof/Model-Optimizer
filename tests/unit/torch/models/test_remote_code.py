@@ -16,11 +16,13 @@
 """Staging every module of a local checkpoint's remote code."""
 
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
 dmu = pytest.importorskip("transformers.dynamic_module_utils")
 
+from modelopt.torch.models import _remote_code
 from modelopt.torch.models._remote_code import stage_full_remote_closure
 
 
@@ -51,3 +53,34 @@ def test_every_module_of_a_local_checkpoint_is_staged(monkeypatch, tmp_path):
     assert dmu.get_cached_module_file is wrapped
     assert dmu.get_cached_module_file(str(ckpt), "a.py") == str(stage / "a.py")
     assert sorted(p.name for p in stage.iterdir()) == ["a.py", "b.py", "c.py"]
+
+
+def test_a_module_is_staged_whole_or_not_at_all(monkeypatch, tmp_path):
+    """Every rank stages into the same dir and imports what it finds there, so a module must not
+    appear before its copy completes: a copy cut short leaves nothing behind for a rank to take as
+    staged, and the next load stages the whole module."""
+    ckpt, stage = tmp_path / "ckpt", tmp_path / "stage"
+    ckpt.mkdir()
+    stage.mkdir()
+    (ckpt / "a.py").write_text("from .b import B\n")
+    (ckpt / "b.py").write_text("B = 1\n" * 100)
+
+    def stage_only_the_module(path, module_file, *args, **kwargs):
+        shutil.copy(ckpt / module_file, stage / module_file)
+        return str(stage / module_file)
+
+    def copy_cut_short(src, dst):
+        with open(src) as f, open(dst, "w") as out:
+            out.write(f.read()[:10])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dmu, "get_cached_module_file", stage_only_the_module)
+    stage_full_remote_closure()
+    with monkeypatch.context() as m:
+        m.setattr(_remote_code, "shutil", SimpleNamespace(copy=copy_cut_short))
+        with pytest.warns(UserWarning, match="No space left"):
+            dmu.get_cached_module_file(str(ckpt), "a.py")
+    assert not (stage / "b.py").exists()
+
+    dmu.get_cached_module_file(str(ckpt), "a.py")
+    assert (stage / "b.py").read_text() == (ckpt / "b.py").read_text()

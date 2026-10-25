@@ -2349,6 +2349,15 @@ def load_and_prepare_ep(
         )
     # The swapped plan is this load's own: the caller's config keeps the plan its checkpoint declares.
     hf_config = copy.deepcopy(hf_config)
+    if _decompressed_as_loaded(hf_config):
+        # The decompressor hands the experts over dequantized. Left on the config (Kimi-K2.5's config
+        # class copies its text config's to the top level), the checkpoint's quantization_config
+        # would build transformers' compressed-tensors quantizer, which from 5.13 claims the same
+        # expert converters first. Deleted rather than set to None: before 5.11 transformers takes
+        # any quantization_config attribute, None too, for a quantized checkpoint.
+        for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+            if cfg is not None and hasattr(cfg, "quantization_config"):
+                del cfg.quantization_config
     ep_cfg = _ep_config(hf_config)  # for VLMs the plan lives on .text_config
     ep_plan = dict(getattr(ep_cfg, "base_model_ep_plan", None) or {})
     if not ep_plan:

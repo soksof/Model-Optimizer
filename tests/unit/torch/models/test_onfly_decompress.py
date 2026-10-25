@@ -387,6 +387,36 @@ def test_only_the_compressed_checkpoint_loads_through_the_rewritten_converters(m
     assert onfly._MARK not in model.config.to_dict()
 
 
+@pytest.mark.usefixtures("restore_loader_hooks")
+@pytest.mark.parametrize("marked", ["vlm", "text-config"])
+@pytest.mark.parametrize("loaded", ["vlm", "backbone"])
+def test_a_vlm_marked_at_either_level_loads_through_the_rewritten_converters(
+    monkeypatch, marked, loaded
+):
+    """A VLM carries its compressed-tensors config at the top level or on its text config, and the
+    install marks the config it is handed. Whether the load builds the VLM, its text config replaced
+    by the native backbone's, or that backbone on its own, its expert converters are rewritten, and
+    neither level keeps the mark for a later save."""
+    monkeypatch.setattr(
+        mu, "get_model_conversion_mapping", lambda model, **kw: list(_stock_expert_converters())
+    )
+    compression = (_ScaledCompressor, None, PACKED, "stub-format")
+    monkeypatch.setattr(onfly, "_read_compression", lambda cfg: compression)
+    text = _RemoteTextConfig(hidden_size=64, quantization_config={"format": "stub-format"})
+    vlm = SimpleNamespace(text_config=text)
+    onfly.install_onfly_decompress(vlm if marked == "vlm" else text)
+    vlm.text_config = onfly.to_native_backbone_config(vlm)
+    model = SimpleNamespace(config=copy.deepcopy(vlm if loaded == "vlm" else vlm.text_config))
+
+    out = mu.get_model_conversion_mapping(model)
+
+    assert [conv.source_patterns[0] for conv in out] == [
+        "mlp.experts.*.gate_proj.weight_packed$",
+        "mlp.experts.*.down_proj.weight_packed$",
+    ]
+    assert not onfly.is_marked(model.config)
+
+
 # ------------------------------------------------------------------------ reading the checkpoint
 
 
@@ -507,22 +537,35 @@ EXPERTS = ["re:.*experts.*"]
 
 
 @pytest.mark.parametrize(
-    "groups",
+    ("groups", "error", "match"),
     [
-        {"attn": _int4(True, ATTN), "moe": _int4(False, EXPERTS)},
-        {"attn": _int4(False, ATTN), "dense": _int4(True, ["Linear"])},
+        (
+            {"attn": _int4(True, ATTN), "moe": _int4(False, EXPERTS)},
+            NotImplementedError,
+            "2 compressed-tensors config groups",
+        ),
+        (
+            {"attn": _int4(False, ATTN), "dense": _int4(True, ["Linear"])},
+            NotImplementedError,
+            "2 compressed-tensors config groups",
+        ),
+        ({"attn": _int4(True, ATTN)}, NotImplementedError, "not the experts"),
+        ({}, ValueError, "nothing to decompress"),
     ],
-    ids=["an-expert-group-among-others", "no-expert-group"],
+    ids=["an-expert-group-among-others", "no-expert-group", "one-group-not-the-experts", "none"],
 )
-def test_a_checkpoint_compressed_in_several_config_groups_is_refused(groups):
+def test_a_checkpoint_whose_experts_are_not_its_one_compressed_group_is_refused(
+    groups, error, match
+):
     """Only the expert converters are rewritten: another group's weights would load newly
-    initialized, and a group guessed for the experts would decompress them with the wrong scheme."""
+    initialized, a group guessed for the experts would decompress them with the wrong scheme, and
+    experts no group targets are stored as plain weights the rewritten converters would not find."""
     pytest.importorskip(
         "compressed_tensors", reason="needs compressed-tensors (CI's unit session installs it)"
     )
     config = SimpleNamespace(quantization_config=_pack_quantized(**groups))
 
-    with pytest.raises(NotImplementedError, match="2 compressed-tensors config groups"):
+    with pytest.raises(error, match=match):
         onfly._read_compression(config)
 
 

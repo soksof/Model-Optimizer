@@ -18,6 +18,7 @@
 import glob
 import os
 import shutil
+import tempfile
 import warnings
 
 
@@ -52,7 +53,12 @@ def stage_full_remote_closure() -> None:
                 for py in glob.glob(os.path.join(src, "*.py")):
                     dst = os.path.join(stage_dir, os.path.basename(py))
                     if not os.path.exists(dst):
-                        shutil.copy(py, dst)
+                        # Every rank loading the checkpoint stages into this dir and imports from it:
+                        # renamed into place (atomic), a file appears there whole, never half written.
+                        fd, tmp = tempfile.mkstemp(dir=stage_dir)
+                        os.close(fd)
+                        shutil.copy(py, tmp)
+                        os.replace(tmp, dst)
             except OSError as e:  # a failed copy only matters if a deeper import needs the file
                 warnings.warn(f"Could not stage the remote code of {src}: {e}")
         return resolved

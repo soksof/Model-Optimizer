@@ -384,32 +384,44 @@ def test_the_weights_load_in_the_checkpoints_dtype_through_its_class(ep_world_of
     assert classes == [True]
 
 
-def test_a_compressed_checkpoint_a_spec_decompresses_as_it_loads_passes(monkeypatch):
+def test_a_compressed_checkpoint_a_spec_decompresses_as_it_loads_passes(
+    ep_world_of_two, monkeypatch
+):
     """A model spec that installs the on-the-fly decompressor (Kimi-K2.5's) marks the config; that
-    checkpoint passes the format check, and the same checkpoint unmarked does not."""
+    checkpoint passes the format check and loads without its quantization_config, at either level,
+    which would build transformers' own compressed-tensors quantizer to compete with the
+    decompressor. The same checkpoint unmarked is refused, and the caller's config keeps its own."""
     from modelopt.torch.models import _onfly_decompress
 
-    class _ResolvedPastFormatError(Exception):
-        """Stops the load where it resolves the checkpoint, past the format check."""
+    class _LoadedError(Exception):
+        """Stops the load at from_pretrained."""
 
-    def resolve(path, rank):
-        raise _ResolvedPastFormatError
+    loaded = {}
 
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "size", lambda group=None: 2)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
-    monkeypatch.setattr(moe, "require_transformers", lambda *args: None)
-    monkeypatch.setattr(model_load_utils, "_resolve_checkpoint_dir", resolve)
-    config = SimpleNamespace(
-        quantization_config={"quant_method": "compressed-tensors"}, base_model_ep_plan=_EP_PLAN
+    class _Loader:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            loaded.update(kwargs)
+            raise _LoadedError
+
+    monkeypatch.setattr(
+        "torch.distributed.device_mesh.init_device_mesh", lambda *args, **kwargs: _Mesh()
     )
+    monkeypatch.setattr(model_load_utils, "_auto_class", lambda *args, **kwargs: _Loader)
+    quantization_config = {"quant_method": "compressed-tensors"}
+    text = SimpleNamespace(quantization_config=quantization_config, base_model_ep_plan=_EP_PLAN)
+    config = SimpleNamespace(quantization_config=quantization_config, text_config=text)
     plan = DistributionPlan(2, ep_size=2)
 
     with pytest.raises(NotImplementedError, match="cannot dequantize"):
         load_and_prepare_ep("org/model", plan, hf_config=config)
     _onfly_decompress._mark(config, "pack-quantized")
-    with pytest.raises(_ResolvedPastFormatError):
+    with pytest.raises(_LoadedError):
         load_and_prepare_ep("org/model", plan, hf_config=config)
+
+    assert not hasattr(loaded["config"], "quantization_config")
+    assert not hasattr(loaded["config"].text_config, "quantization_config")
+    assert config.quantization_config is text.quantization_config is quantization_config
 
 
 # ------------------------------------------------------------------------ quant wrappers

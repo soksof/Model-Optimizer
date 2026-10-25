@@ -62,7 +62,12 @@ def to_native_backbone_config(
         d.pop(key, None)
     d["model_type"] = model_type
     d["architectures"] = list(architectures)
-    return CONFIG_MAPPING[model_type].from_dict(d)
+    native = CONFIG_MAPPING[model_type].from_dict(d)
+    fmt = getattr(vlm_config, _MARK, None) or getattr(text_config, _MARK, None)
+    if fmt is not None:
+        # A backbone loaded from this config on its own decompresses as the VLM would.
+        _mark(native, fmt)
+    return native
 
 
 def _find_quantization_config(hf_config):
@@ -92,8 +97,8 @@ def _read_compression(hf_config):
     ``compressor`` is the registered compressor for ``format`` (its ``decompress`` classmethod is the
     dequant); ``scheme`` is the ``QuantizationScheme`` (supplies ``scheme.weights`` to ``decompress``);
     ``param_names`` is the exact set of stored sibling keys per weight. The checkpoint's one config
-    group is the experts' scheme; a checkpoint with several is refused.
-    ``None`` for a config with no ``quantization_config``: nothing to decompress."""
+    group is the experts' scheme; a checkpoint with several, or whose one group does not target the
+    experts, is refused. ``None`` for a config with no ``quantization_config``: nothing to decompress."""
     # Look the config up first: with none, compressed_tensors need not even be installed. A config
     # that fails to parse raises pydantic's ValidationError, a ValueError of its own.
     quantization_config = _find_quantization_config(hf_config)
@@ -104,15 +109,29 @@ def _read_compression(hf_config):
 
     qconfig = QuantizationConfig.model_validate(quantization_config)
     groups = qconfig.config_groups
-    if len(groups) != 1:
+    if not groups:
+        raise ValueError(
+            "install_onfly_decompress: the checkpoint's compressed-tensors quantization_config has "
+            "no config groups: nothing to decompress."
+        )
+    if len(groups) > 1:
         # Only the expert converters are rewritten, so another group's weights would load newly
         # initialized, and which group holds the experts would be a guess.
         raise NotImplementedError(
             f"install_onfly_decompress: the checkpoint has {len(groups)} compressed-tensors config "
-            f"groups ({', '.join(groups) or 'none'}); on-the-fly decompression handles a single "
-            "group, compressing only the experts. Decompress the checkpoint first."
+            f"groups ({', '.join(groups)}); on-the-fly decompression handles a single group, "
+            "compressing only the experts. Decompress the checkpoint first."
         )
     [scheme] = groups.values()
+    # The experts' group as transformers' own compressed-tensors loader finds it: a class target
+    # (the checkpoint's experts are Linear modules) or a regex naming the experts. Another group
+    # leaves the experts stored as plain weights, which the rewritten converters would not find.
+    if not any(not t.startswith("re:") or "experts" in t for t in scheme.targets):
+        raise NotImplementedError(
+            f"install_onfly_decompress: the checkpoint's compressed-tensors config group targets "
+            f"{scheme.targets}, not the experts; on-the-fly decompression handles a checkpoint "
+            "whose experts are what it compresses. Decompress the checkpoint first."
+        )
     fmt = qconfig.format
     fmt = fmt.value if hasattr(fmt, "value") else str(fmt)
     compressor = BaseCompressor.get_value_from_registry(fmt)
@@ -273,8 +292,10 @@ def install_onfly_decompress(hf_config):
 
     The hooks are process-wide, so a process decompresses one compressed checkpoint: installing again
     for it marks that config too, and installing for a checkpoint compressed differently raises. Only a
-    model built from a marked config has its converters rewritten; any other model ``from_pretrained``
-    loads in the process, an uncompressed MoE say, keeps its stock converters."""
+    model built from a marked config, or from one whose ``text_config`` is marked, has its converters
+    rewritten; any other model ``from_pretrained`` loads in the process, an uncompressed MoE say,
+    keeps its stock converters. :func:`to_native_backbone_config` carries the mark to the backbone
+    config it derives."""
     from modelopt.torch.utils import print_rank_0
     from modelopt.torch.utils.moe import require_transformers
 
@@ -287,8 +308,8 @@ def install_onfly_decompress(hf_config):
     installed = getattr(mu.get_model_conversion_mapping, "_onfly_compression", None)
     if installed is not None:
         if compression is None:
-            # The prepare that installed the hooks drops quantization_config from its config, already
-            # marked, and may run again on that same config: nothing new to decompress.
+            # A config its prepare dropped quantization_config from after installing (Kimi-K3's),
+            # already marked, may be prepared again: nothing new to decompress.
             return
         if compression != installed:
             raise RuntimeError(
@@ -311,13 +332,15 @@ def install_onfly_decompress(hf_config):
     def patched(*args, **kwargs):
         convs = orig(*args, **kwargs)
         config = getattr(args[0] if args else kwargs["model"], "config", None)
-        if getattr(config, _MARK, None) is None:
+        if not is_marked(config):
             # Not the compressed checkpoint: rewritten, an uncompressed MoE's experts would match no
             # stored key and load newly initialized without an error.
             return convs
         # from_pretrained loads from a copy of the marked config; the mark must not reach the config
-        # a later save writes.
-        delattr(config, _MARK)
+        # a later save writes, at either level.
+        for c in (config, getattr(config, "text_config", None)):
+            if hasattr(c, _MARK):
+                delattr(c, _MARK)
         out = []
         for c in convs:
             # only the per-expert MoE converters (have `.weight` sources under `experts`)
